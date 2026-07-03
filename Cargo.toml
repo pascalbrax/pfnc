@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.82"
+
+[workspace.dependencies]
+pfnc-core = { path = "crates/core" }
+pfnc-vfs-local = { path = "crates/vfs-local" }
+pfnc-vfs-sftp = { path = "crates/vfs-sftp" }
+pfnc-vfs-archive = { path = "crates/vfs-archive" }
+pfnc-config = { path = "crates/config" }
+pfnc-tui = { path = "crates/tui" }
+
+ratatui = "0.29"
+crossterm = "0.28"
+ssh2 = "0.9"
+zstd = "0.13"
+tar = "0.4"
+zip = "2"
+walkdir = "2"
+camino = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+directories = "5"
+crossbeam-channel = "0.5"
+tempfile = "3"

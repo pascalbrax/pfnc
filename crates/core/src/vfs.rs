@@ -117,4 +117,20 @@ pub trait Vfs: Send + Sync {
     /// The root path within this backend's namespace ("/" for local/SFTP;
     /// archive-internal root for `ArchiveFs`).
     fn root(&self) -> VfsPath;
+
+    /// A cheap content hash (XXH64) for `path`, used by directory sync to
+    /// tell identical files apart from changed ones without relying solely
+    /// on mtime. Returns `Ok(None)` when a fast hash isn't available here
+    /// (the default for any backend that doesn't override this) — callers
+    /// must fall back to a size/mtime comparison in that case, never treat
+    /// `None` as an error.
+    ///
+    /// Implementations must never make this *more* expensive than just
+    /// copying the file would be: computing a hash by streaming the whole
+    /// file across a slow link defeats the purpose of a "quick" check.
+    /// `LocalFs` hashes in-process (free); `SftpFs` only returns `Some` when
+    /// it can compute the hash *on the remote host* via an exec channel.
+    fn quick_hash(&self, _path: &VfsPath) -> VfsResult<Option<u64>> {
+        Ok(None)
+    }
 }

@@ -64,7 +64,7 @@ mod tests {
     fn renders_dual_panels_with_fkey_bar() {
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        let left = sample_panel();
+        let mut left = sample_panel();
         let mut right = sample_panel();
         right.location = Location::Local;
         right.cwd = VfsPath::from("/tmp");
@@ -73,8 +73,8 @@ mod tests {
             .draw(|f| {
                 let (panels_area, _status, fkeys_area) = split_main(f.area());
                 let (left_rect, right_rect) = split_panels(panels_area);
-                render_panel(f, left_rect, &left, true);
-                render_panel(f, right_rect, &right, false);
+                render_panel(f, left_rect, &mut left, true);
+                render_panel(f, right_rect, &mut right, false);
                 render_fkey_bar(f, fkeys_area);
             })
             .unwrap();
@@ -87,5 +87,60 @@ mod tests {
         assert!(rendered.contains("Copy"));
         assert!(rendered.contains("F8"));
         assert!(rendered.contains("Delete"));
+    }
+
+    fn panel_with_many_entries(count: usize, cursor: usize) -> PanelState {
+        let mut panel = PanelState::new(Location::Local, VfsPath::from("/big"));
+        panel.entries = (0..count)
+            .map(|i| EntryMeta {
+                name: format!("file{i:03}"),
+                path: VfsPath::from(format!("/big/file{i:03}")),
+                kind: EntryKind::File,
+                size: 0,
+                modified: None,
+                permissions: Some(0o644),
+                owner: None,
+                group: None,
+            })
+            .collect();
+        panel.cursor = cursor;
+        panel
+    }
+
+    #[test]
+    fn cursor_stays_visible_when_entries_exceed_screen_height() {
+        // A short terminal: not enough rows for all 100 entries.
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut panel = panel_with_many_entries(100, 80);
+
+        terminal
+            .draw(|f| render_panel(f, f.area(), &mut panel, true))
+            .unwrap();
+
+        let rendered = rendered_text(&terminal);
+        assert!(
+            rendered.contains("file080"),
+            "the entry under the cursor must be scrolled into view, got:\n{rendered}"
+        );
+        // Entries well before the scrolled window shouldn't still be shown.
+        assert!(!rendered.contains("file000"));
+        assert_eq!(panel.cursor, 80, "rendering must not move the cursor itself");
+        assert!(panel.scroll_offset > 0, "scroll_offset must advance once the list overflows the screen");
+    }
+
+    #[test]
+    fn cursor_at_top_keeps_scroll_offset_at_zero() {
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut panel = panel_with_many_entries(100, 0);
+
+        terminal
+            .draw(|f| render_panel(f, f.area(), &mut panel, true))
+            .unwrap();
+
+        assert_eq!(panel.scroll_offset, 0);
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("file000"));
     }
 }

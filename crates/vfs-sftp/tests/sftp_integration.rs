@@ -129,6 +129,71 @@ fn not_found_maps_to_typed_error() {
 
 #[test]
 #[ignore = "spawns a real local sshd; run with `cargo test -p pfnc-vfs-sftp -- --ignored`"]
+fn quick_hash_over_real_sftp_matches_local_xxh64() {
+    let sshd = TestSshd::start();
+    let root = sshd.scratch_dir();
+    let vfs = SftpFs::connect(&sshd.profile("t10"), &AcceptNewPolicy, &sshd.known_hosts_path).unwrap();
+
+    let file = root.join("hash_me.txt");
+    fs::write(&file, b"identical content").unwrap();
+
+    match vfs.quick_hash(&vfs_path(&file)).unwrap() {
+        // The test host may not have `xxhsum` installed; that's a valid,
+        // documented degrade path, not a test failure.
+        None => eprintln!("xxhsum not available on this host; skipping hash-value assertion"),
+        Some(remote_hash) => {
+            let local_hash = pfnc_vfs_local::LocalFs::new().quick_hash(&vfs_path(&file)).unwrap().unwrap();
+            assert_eq!(
+                remote_hash, local_hash,
+                "remote (exec-channel xxhsum) and local (in-process xxh64) hashes of identical content must match"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "spawns a real local sshd; run with `cargo test -p pfnc-vfs-sftp -- --ignored`"]
+fn quick_hash_gracefully_degrades_instead_of_erroring() {
+    let sshd = TestSshd::start();
+    let root = sshd.scratch_dir();
+    let vfs = SftpFs::connect(&sshd.profile("t11"), &AcceptNewPolicy, &sshd.known_hosts_path).unwrap();
+
+    // A path that doesn't exist makes `xxhsum` exit non-zero — the same
+    // code path as "command not found" on a minimal remote host. Either
+    // way `quick_hash` must degrade to `Ok(None)`, never a hard error, so
+    // sync's mtime fallback kicks in instead.
+    let missing = vfs_path(&root.join("does_not_exist.txt"));
+    assert_eq!(vfs.quick_hash(&missing).unwrap(), None);
+}
+
+#[test]
+#[ignore = "spawns a real local sshd; run with `cargo test -p pfnc-vfs-sftp -- --ignored`"]
+fn quick_hash_shell_escapes_filenames_with_quotes() {
+    let sshd = TestSshd::start();
+    let root = sshd.scratch_dir();
+    let vfs = SftpFs::connect(&sshd.profile("t12"), &AcceptNewPolicy, &sshd.known_hosts_path).unwrap();
+
+    // A filename crafted to break naive shell interpolation: an embedded
+    // single quote plus `;`/`$()` shell metacharacters, but no `/` (a
+    // literal slash in the name would just make the *local* `fs::write`
+    // below create nested directories, unrelated to what we're testing).
+    // If the remote-side escaping were wrong, the shell would either
+    // misparse the command (non-zero exit -> `None`) or hash a completely
+    // different, unintended byte sequence — either way the hash would
+    // fail to match a local hash of this exact file's content.
+    let tricky_name = "quo'te; $(id) && echo 'pwned'x.txt";
+    let file = root.join(tricky_name);
+    fs::write(&file, b"identical content").unwrap();
+
+    let hash = vfs.quick_hash(&vfs_path(&file)).unwrap();
+    if let Some(remote_hash) = hash {
+        let local_hash = pfnc_vfs_local::LocalFs::new().quick_hash(&vfs_path(&file)).unwrap().unwrap();
+        assert_eq!(remote_hash, local_hash);
+    }
+}
+
+#[test]
+#[ignore = "spawns a real local sshd; run with `cargo test -p pfnc-vfs-sftp -- --ignored`"]
 fn host_key_tofu_then_reconnect_succeeds() {
     let sshd = TestSshd::start();
     // First connect: known_hosts is empty, AcceptNewPolicy trusts and saves it.

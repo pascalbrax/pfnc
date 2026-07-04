@@ -42,7 +42,7 @@ fn home_dir_vfs_path() -> VfsPath {
 /// events without polling itself.
 ///
 /// Uses a short `poll()` rather than a blocking `read()` specifically so
-/// it can be paused via `gate`: F4 hands the real terminal to an external
+/// it can be paused via `gate`: F3 hands the real terminal to an external
 /// editor process, and if this thread were still blocked inside a raw
 /// `read()` on the same terminal, it would race the child process for
 /// keystrokes.
@@ -108,7 +108,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     let tick_rx = crossbeam_channel::tick(Duration::from_millis(250));
 
     loop {
-        terminal.draw(|f| ui::render(f, &*app)).context("failed to draw frame")?;
+        terminal.draw(|f| ui::render(f, &mut *app)).context("failed to draw frame")?;
         if app.should_quit {
             return Ok(());
         }

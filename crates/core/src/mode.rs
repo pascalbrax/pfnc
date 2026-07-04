@@ -3,7 +3,9 @@
 //! structs (no behavior beyond small, self-contained text editing) is what
 //! lets `pfnc-tui` stay "rendering only".
 
-use crate::job::{JobId, JobProgress};
+use std::sync::{Arc, Mutex};
+
+use crate::job::{JobId, JobProgress, SyncPlan};
 use crate::vfs::{Location, VfsPath};
 
 #[derive(Clone, Debug, Default)]
@@ -19,7 +21,25 @@ pub enum Mode {
 #[derive(Clone, Debug)]
 pub struct ConfirmDialog {
     pub message: String,
-    pub items: Vec<VfsPath>,
+    pub purpose: ConfirmPurpose,
+}
+
+/// What happens when the user confirms a `Mode::Confirm` dialog. Mirrors
+/// `TextInputPurpose`'s "one mode, many purposes" shape so adding a new
+/// kind of confirmation doesn't need a new `Mode` variant.
+#[derive(Clone, Debug)]
+pub enum ConfirmPurpose {
+    Delete {
+        items: Vec<VfsPath>,
+    },
+    /// Approving an already-scanned directory sync: `plan` is exactly what
+    /// gets applied (no rescanning on confirm), `src_location`/
+    /// `dst_location` identify the endpoints for transport negotiation.
+    Sync {
+        plan: SyncPlan,
+        src_location: Location,
+        dst_location: Location,
+    },
 }
 
 /// A single line of editable text with a char-index cursor. Shared by
@@ -220,6 +240,32 @@ impl ConnectForm {
     }
 }
 
+/// A one-shot side-channel for a `ScanSync` job to hand its computed
+/// `SyncPlan` back to the main thread: `JobOutcome` carries no payload, so
+/// the job closure fills this in via `set` right before returning `Ok(())`,
+/// and `handle_job_event` drains it via `take` once it sees the job's
+/// `Finished` event — the same shape already used by
+/// `registry.open_archive_and_cache` (a registry-side cache keyed by
+/// `Location`) for `JobKind::OpenArchive`.
+#[derive(Clone, Debug, Default)]
+pub struct SyncPlanCell(Arc<Mutex<Option<SyncPlan>>>);
+
+impl SyncPlanCell {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set(&self, plan: SyncPlan) {
+        *self.0.lock().unwrap() = Some(plan);
+    }
+
+    /// Takes the plan out, leaving `None` behind. Returns `None` if the job
+    /// never called `set` (e.g. it failed before finishing the scan).
+    pub fn take(&self) -> Option<SyncPlan> {
+        self.0.lock().unwrap().take()
+    }
+}
+
 /// What a running job (`Mode::Progress`) should do when it finishes,
 /// beyond the generic progress-bar bookkeeping every job gets.
 #[derive(Clone, Debug)]
@@ -235,6 +281,17 @@ pub enum JobKind {
     /// success, the panel identified by `target_left` should switch to
     /// `location` (already the full `Location::Archive { .. }`).
     OpenArchive { target_left: bool, location: Location },
+    /// Scanning two directories for `sync`: on success, the plan drained
+    /// from `plan_cell` becomes a `Mode::Confirm` summary (or, if it's a
+    /// no-op, just a status message) — nothing is copied or deleted yet.
+    ScanSync {
+        src_location: Location,
+        dst_location: Location,
+        plan_cell: SyncPlanCell,
+    },
+    /// Applying an already-approved `SyncPlan`: on completion, reload the
+    /// affected panels, same as `FileOp`.
+    ExecuteSync,
 }
 
 #[derive(Clone, Debug)]

@@ -3,8 +3,8 @@ use std::sync::Arc;
 use crossterm::event::{KeyCode, KeyEvent};
 
 use pfnc_core::{
-    job, ConfirmDialog, ConnectForm, JobEvent, JobKind, JobOutcome, Location, Mode, ProgressState,
-    SavedProfileSummary, TextInputPrompt, TextInputPurpose, VfsPath,
+    job, ConfirmDialog, ConfirmPurpose, ConnectForm, JobEvent, JobKind, JobOutcome, Location, Mode, ProgressState,
+    SavedProfileSummary, SyncPlanCell, TextInputPrompt, TextInputPurpose, VfsPath,
 };
 use pfnc_vfs_sftp::{AuthMethod, ConnectionProfile};
 
@@ -54,6 +54,10 @@ fn handle_browsing_key(app: &mut App, key: KeyCode) {
                 start_connect(app);
                 return;
             }
+            "sync" => {
+                start_sync(app);
+                return;
+            }
             _ => {}
         }
     }
@@ -70,11 +74,27 @@ fn handle_browsing_key(app: &mut App, key: KeyCode) {
         }
         KeyCode::Up | KeyCode::Char('k') => app.active_panel_mut().move_cursor(-1),
         KeyCode::Down | KeyCode::Char('j') => app.active_panel_mut().move_cursor(1),
+        KeyCode::PageUp => {
+            let page = page_size(app.active_panel());
+            app.active_panel_mut().move_cursor(-page);
+        }
+        KeyCode::PageDown => {
+            let page = page_size(app.active_panel());
+            app.active_panel_mut().move_cursor(page);
+        }
         KeyCode::Char(' ') => toggle_selection(app),
         KeyCode::Enter => descend(app),
         KeyCode::Backspace | KeyCode::Left => ascend(app),
         _ => {}
     }
+}
+
+/// How far PageUp/PageDown move the cursor: a full screen's worth of rows,
+/// from the panel's last rendered `viewport_height` (set by
+/// `pfnc-tui::render_panel` each frame). Falls back to 1 for the
+/// vanishingly unlikely case a page key arrives before the first render.
+fn page_size(panel: &pfnc_core::PanelState) -> isize {
+    panel.viewport_height.max(1) as isize
 }
 
 fn toggle_selection(app: &mut App) {
@@ -224,7 +244,10 @@ fn start_delete(app: &mut App) {
     } else {
         format!("Delete {} items?", items.len())
     };
-    app.mode = Mode::Confirm(ConfirmDialog { message, items });
+    app.mode = Mode::Confirm(ConfirmDialog {
+        message,
+        purpose: ConfirmPurpose::Delete { items },
+    });
 }
 
 fn spawn_delete(app: &mut App, items: Vec<VfsPath>) {
@@ -258,9 +281,67 @@ fn start_connect(app: &mut App) {
     app.mode = Mode::Connect(ConnectForm::new(default_username, saved));
 }
 
+/// Starts a directory sync of the whole current directories of both panels
+/// (active = source, inactive = destination) — `rsync src/ dst/`
+/// semantics, not the per-selected-item semantics of copy/move/delete.
+/// Only scans and builds a plan here; nothing is copied or deleted until
+/// the user confirms the summary (see `JobKind::ScanSync`'s handling in
+/// `handle_job_event`).
+fn start_sync(app: &mut App) {
+    let src_location = app.active_panel().location.clone();
+    let src_root = app.active_panel().cwd.clone();
+    let dst_location = app.inactive_panel().location.clone();
+    let dst_root = app.inactive_panel().cwd.clone();
+    let delete_extraneous = app.config.general.sync_delete_extraneous;
+    let registry = Arc::clone(&app.registry);
+
+    let (src, dst) = match (registry.resolve(&src_location), registry.resolve(&dst_location)) {
+        (Ok(s), Ok(d)) => (s, d),
+        (Err(e), _) | (_, Err(e)) => {
+            app.status = Some(format!("sync failed: {e}"));
+            return;
+        }
+    };
+
+    let plan_cell = SyncPlanCell::new();
+    let plan_cell_for_job = plan_cell.clone();
+    let job_id = app.jobs.spawn("Scan sync", move |cancel, report| {
+        let plan =
+            job::build_sync_plan(src.as_ref(), dst.as_ref(), &src_root, &dst_root, delete_extraneous, cancel, report)?;
+        plan_cell_for_job.set(plan);
+        Ok(())
+    });
+    app.mode = Mode::Progress(ProgressState {
+        job_id,
+        title: "Scanning for sync".into(),
+        progress: Default::default(),
+        kind: JobKind::ScanSync { src_location, dst_location, plan_cell },
+    });
+}
+
+fn spawn_execute_sync(app: &mut App, plan: pfnc_core::SyncPlan, src_location: Location, dst_location: Location) {
+    let registry = Arc::clone(&app.registry);
+    let job_id = app.jobs.spawn("Sync", move |cancel, report| {
+        let src = registry.resolve(&src_location)?;
+        let dst = registry.resolve(&dst_location)?;
+        job::execute_sync_plan(src.as_ref(), dst.as_ref(), &src_location, &dst_location, &plan, cancel, report)
+    });
+    app.mode = Mode::Progress(ProgressState {
+        job_id,
+        title: "Syncing".into(),
+        progress: Default::default(),
+        kind: JobKind::ExecuteSync,
+    });
+}
+
 fn handle_confirm_key(app: &mut App, dialog: ConfirmDialog, key: KeyCode) {
     match key {
-        KeyCode::Char('y') | KeyCode::Enter => spawn_delete(app, dialog.items),
+        KeyCode::Char('y') | KeyCode::Enter => match dialog.purpose {
+            ConfirmPurpose::Delete { items } => spawn_delete(app, items),
+            ConfirmPurpose::Sync { plan, src_location, dst_location } => {
+                spawn_execute_sync(app, plan, src_location, dst_location)
+            }
+        },
         KeyCode::Char('n') | KeyCode::Esc => app.mode = Mode::Browsing,
         _ => app.mode = Mode::Confirm(dialog),
     }
@@ -348,7 +429,7 @@ fn spawn_copy(app: &mut App, items: Vec<VfsPath>, dest_dir: VfsPath) {
     };
 
     let job_id = app.jobs.spawn("Copy", move |cancel, report| {
-        job::copy_job(src.as_ref(), dst.as_ref(), &items, &dest_dir, cancel, report)
+        job::copy_job(src.as_ref(), dst.as_ref(), &src_location, &dst_location, &items, &dest_dir, cancel, report)
     });
     app.mode = Mode::Progress(ProgressState {
         job_id,
@@ -400,7 +481,16 @@ fn spawn_move_to_dir(app: &mut App, items: Vec<VfsPath>, dest_dir: VfsPath) {
         }
     };
     let job_id = app.jobs.spawn("Move", move |cancel, report| {
-        job::move_cross_backend(src.as_ref(), dst.as_ref(), &items, &dest_dir, cancel, report)
+        job::move_cross_backend(
+            src.as_ref(),
+            dst.as_ref(),
+            &src_location,
+            &dst_location,
+            &items,
+            &dest_dir,
+            cancel,
+            report,
+        )
     });
     app.mode = Mode::Progress(ProgressState {
         job_id,
@@ -577,7 +667,47 @@ pub fn handle_job_event(app: &mut App, event: JobEvent) {
                         reload(&app.registry, panel);
                     }
                 }
+                JobKind::ScanSync { src_location, dst_location, plan_cell } => {
+                    if !matches!(outcome, JobOutcome::Completed) {
+                        return;
+                    }
+                    let Some(plan) = plan_cell.take() else {
+                        app.status = Some("sync scan produced no plan".to_string());
+                        return;
+                    };
+                    if plan.is_empty() {
+                        app.status = Some("Nothing to sync".to_string());
+                        return;
+                    }
+                    let mut message = format!("{} to copy ({})", plan.files_to_copy, format_bytes(plan.bytes_total));
+                    if plan.items_to_delete > 0 {
+                        message.push_str(&format!(", {} to delete", plan.items_to_delete));
+                    }
+                    message.push_str(" — proceed?");
+                    app.mode = Mode::Confirm(ConfirmDialog {
+                        message,
+                        purpose: ConfirmPurpose::Sync { plan, src_location, dst_location },
+                    });
+                }
+                JobKind::ExecuteSync => app.reload_both(),
             }
         }
+    }
+}
+
+/// Human-readable byte count for the sync confirmation summary (e.g.
+/// `"3.4 MB"`).
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }

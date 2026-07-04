@@ -238,6 +238,40 @@ fn cursor_resets_to_top_when_entering_a_directory() {
 }
 
 #[test]
+fn page_down_and_page_up_move_by_a_full_screen() {
+    let dir = tempdir().unwrap();
+    let root = vfs_path(dir.path());
+    for i in 0..20 {
+        fs::write(dir.path().join(format!("f{i:02}")), b"x").unwrap();
+    }
+
+    let mut app = App::new(root);
+    assert_eq!(app.left.entries.len(), 20);
+    // Simulate what `pfnc-tui::render_panel` sets from the real terminal
+    // size each frame — these tests drive `App` directly, with no
+    // terminal/rendering involved.
+    app.left.viewport_height = 5;
+
+    press(&mut app, KeyCode::PageDown);
+    assert_eq!(app.left.cursor, 5);
+    press(&mut app, KeyCode::PageDown);
+    assert_eq!(app.left.cursor, 10);
+
+    press(&mut app, KeyCode::PageUp);
+    assert_eq!(app.left.cursor, 5);
+
+    // Clamps at the ends rather than wrapping or erroring.
+    for _ in 0..10 {
+        press(&mut app, KeyCode::PageUp);
+    }
+    assert_eq!(app.left.cursor, 0);
+    for _ in 0..10 {
+        press(&mut app, KeyCode::PageDown);
+    }
+    assert_eq!(app.left.cursor, 19);
+}
+
+#[test]
 fn mkdir_via_text_input_creates_directory_and_reloads() {
     let dir = tempdir().unwrap();
     let root = vfs_path(dir.path());
@@ -359,4 +393,100 @@ fn delete_confirmation_cancel_leaves_file_untouched() {
 
     assert!(matches!(app.mode, Mode::Browsing));
     assert!(root.join("stays.txt").as_std_path().exists());
+}
+
+#[test]
+fn sync_via_f4_scans_confirms_and_copies_only_whats_needed() {
+    let dir = tempdir().unwrap();
+    let root = vfs_path(dir.path());
+    fs::create_dir(dir.path().join("dstdir")).unwrap();
+    fs::create_dir(dir.path().join("srcdir")).unwrap();
+    fs::write(dir.path().join("srcdir/new.txt"), b"fresh").unwrap();
+    fs::write(dir.path().join("srcdir/same.txt"), b"identical").unwrap();
+    fs::write(dir.path().join("dstdir/same.txt"), b"identical").unwrap();
+    fs::write(dir.path().join("dstdir/extra.txt"), b"only on dest").unwrap();
+
+    let mut app = App::new(root.clone());
+    // Entries sort alphabetically: dstdir(0), srcdir(1).
+    // Right panel -> dstdir (destination).
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Enter);
+    // Left panel -> srcdir (source, stays active).
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+
+    press(&mut app, KeyCode::F(4)); // sync's default binding
+    assert!(matches!(app.mode, Mode::Progress(_)), "should start a scan job");
+    wait_for_job_to_finish(&mut app);
+
+    let Mode::Confirm(dialog) = &app.mode else {
+        panic!("expected a Confirm summary after the scan, got {:?}", app.mode);
+    };
+    assert!(dialog.message.contains("1 to copy"), "only new.txt should need copying: {}", dialog.message);
+    // extra.txt is dest-only but delete_extraneous defaults to false.
+    assert!(!dialog.message.contains("delete"), "must not offer to delete without delete_extraneous: {}", dialog.message);
+
+    press(&mut app, KeyCode::Enter); // confirm
+    assert!(matches!(app.mode, Mode::Progress(_)), "should start the execute job");
+    wait_for_job_to_finish(&mut app);
+
+    assert_eq!(fs::read(root.join("dstdir/new.txt")).unwrap(), b"fresh");
+    assert_eq!(fs::read(root.join("dstdir/same.txt")).unwrap(), b"identical");
+    assert!(root.join("dstdir/extra.txt").as_std_path().exists(), "extraneous file must survive a non-mirroring sync");
+}
+
+#[test]
+fn sync_with_delete_extraneous_removes_dest_only_files() {
+    let dir = tempdir().unwrap();
+    let root = vfs_path(dir.path());
+    fs::create_dir(dir.path().join("dstdir")).unwrap();
+    fs::create_dir(dir.path().join("srcdir")).unwrap();
+    fs::write(dir.path().join("dstdir/extra.txt"), b"only on dest").unwrap();
+
+    let mut config = Config::default();
+    config.general.sync_delete_extraneous = true;
+    let mut app = App::new_with_config(config, root.clone());
+
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+
+    press(&mut app, KeyCode::F(4));
+    wait_for_job_to_finish(&mut app);
+
+    let Mode::Confirm(dialog) = &app.mode else {
+        panic!("expected a Confirm summary after the scan, got {:?}", app.mode);
+    };
+    assert!(dialog.message.contains("1 to delete"), "{}", dialog.message);
+
+    press(&mut app, KeyCode::Enter);
+    wait_for_job_to_finish(&mut app);
+
+    assert!(!root.join("dstdir/extra.txt").as_std_path().exists());
+}
+
+#[test]
+fn sync_with_nothing_to_do_shows_status_not_a_confirm_dialog() {
+    let dir = tempdir().unwrap();
+    let root = vfs_path(dir.path());
+    fs::create_dir(dir.path().join("dstdir")).unwrap();
+    fs::create_dir(dir.path().join("srcdir")).unwrap();
+    fs::write(dir.path().join("srcdir/same.txt"), b"identical").unwrap();
+    fs::write(dir.path().join("dstdir/same.txt"), b"identical").unwrap();
+
+    let mut app = App::new(root);
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+
+    press(&mut app, KeyCode::F(4));
+    wait_for_job_to_finish(&mut app);
+
+    assert!(matches!(app.mode, Mode::Browsing), "a no-op sync should not show a confirm dialog");
+    assert_eq!(app.status.as_deref(), Some("Nothing to sync"));
 }

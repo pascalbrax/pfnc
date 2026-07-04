@@ -10,6 +10,7 @@ camino = { workspace = true }
 walkdir = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+xxhash-rust = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

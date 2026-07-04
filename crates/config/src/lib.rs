@@ -33,6 +33,12 @@ pub enum ConfigError {
 pub struct GeneralConfig {
     pub confirm_delete: bool,
     pub show_hidden: bool,
+    /// Whether `sync` also removes destination files/directories that
+    /// don't exist on the source. Defaults to `false` — a sync that only
+    /// ever adds/updates is a much safer default than one that can also
+    /// delete, and the scan-then-confirm flow always shows the user
+    /// exactly what a `true` setting would remove before it happens.
+    pub sync_delete_extraneous: bool,
 }
 
 impl Default for GeneralConfig {
@@ -40,6 +46,7 @@ impl Default for GeneralConfig {
         Self {
             confirm_delete: true,
             show_hidden: false,
+            sync_delete_extraneous: false,
         }
     }
 }

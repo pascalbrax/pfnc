@@ -9,6 +9,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use camino::Utf8PathBuf;
 use pfnc_core::{EntryKind, EntryMeta, Vfs, VfsCapabilities, VfsError, VfsPath, VfsResult};
+use xxhash_rust::xxh64::Xxh64;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LocalFs;
@@ -160,6 +161,24 @@ impl Vfs for LocalFs {
     fn root(&self) -> VfsPath {
         VfsPath::from("/")
     }
+
+    /// Always "available" locally: hashing is just an in-process streaming
+    /// read, no network involved. The seed (0) must match the seed used by
+    /// `xxhsum`'s default `-H1` output so a local hash and a `SftpFs`-side
+    /// remote hash of identical content compare equal.
+    fn quick_hash(&self, path: &VfsPath) -> VfsResult<Option<u64>> {
+        let mut file = File::open(path.as_std_path()).map_err(|e| map_io_err(e, path))?;
+        let mut hasher = Xxh64::new(0);
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = file.read(&mut buf).map_err(|e| map_io_err(e, path))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(Some(hasher.digest()))
+    }
 }
 
 #[cfg(test)]
@@ -262,6 +281,27 @@ mod tests {
             EntryKind::Symlink { target: Some(t) } => assert_eq!(t, target),
             other => panic!("expected symlink with target, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn quick_hash_is_content_sensitive() {
+        let dir = tempdir().unwrap();
+        let root = vfs_path(dir.path());
+        let fs_impl = LocalFs::new();
+
+        let a = root.join("a.txt");
+        let b = root.join("b.txt");
+        let c = root.join("c.txt");
+        fs::write(a.as_std_path(), b"identical content").unwrap();
+        fs::write(b.as_std_path(), b"identical content").unwrap();
+        fs::write(c.as_std_path(), b"different content").unwrap();
+
+        let hash_a = fs_impl.quick_hash(&a).unwrap().unwrap();
+        let hash_b = fs_impl.quick_hash(&b).unwrap().unwrap();
+        let hash_c = fs_impl.quick_hash(&c).unwrap().unwrap();
+
+        assert_eq!(hash_a, hash_b);
+        assert_ne!(hash_a, hash_c);
     }
 
     #[test]

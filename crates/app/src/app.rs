@@ -22,7 +22,7 @@ pub struct App {
     pub jobs: JobManager,
     pub status: Option<String>,
     pub should_quit: bool,
-    /// Set by F4 ("Edit"); the main loop takes this and runs
+    /// Set by F3 ("Edit"); the main loop takes this and runs
     /// `editor::edit_file`, which needs `&mut DefaultTerminal` — something
     /// `actions::handle_key` deliberately doesn't have access to, keeping
     /// terminal suspend/resume out of the input-handling layer.

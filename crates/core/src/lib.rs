@@ -5,12 +5,16 @@
 pub mod job;
 pub mod mode;
 pub mod panel;
+pub mod transport;
 pub mod vfs;
 
-pub use job::{CancellationToken, JobError, JobEvent, JobId, JobManager, JobOutcome, JobProgress};
+pub use job::{
+    CancellationToken, JobError, JobEvent, JobId, JobManager, JobOutcome, JobProgress, SyncCopyItem, SyncPlan,
+};
 pub use mode::{
-    ConfirmDialog, ConnectField, ConnectForm, EditableText, JobKind, Mode, ProgressState, SavedProfileSummary,
-    TextInputPrompt, TextInputPurpose,
+    ConfirmDialog, ConfirmPurpose, ConnectField, ConnectForm, EditableText, JobKind, Mode, ProgressState,
+    SavedProfileSummary, SyncPlanCell, TextInputPrompt, TextInputPurpose,
 };
 pub use panel::PanelState;
+pub use transport::{negotiate_transport, Transport, VfsStreamTransport};
 pub use vfs::{EntryKind, EntryMeta, Location, ProfileId, Vfs, VfsCapabilities, VfsError, VfsPath, VfsResult};

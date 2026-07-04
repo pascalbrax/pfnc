@@ -4,12 +4,13 @@ use ratatui::Frame;
 
 use crate::app::{App, PaneSide};
 
-pub fn render(f: &mut Frame<'_>, app: &App) {
+pub fn render(f: &mut Frame<'_>, app: &mut App) {
     let (panels_area, status_area, fkeys_area) = pfnc_tui::split_main(f.area());
     let (left_rect, right_rect) = pfnc_tui::split_panels(panels_area);
 
-    pfnc_tui::render_panel(f, left_rect, &app.left, app.active == PaneSide::Left);
-    pfnc_tui::render_panel(f, right_rect, &app.right, app.active == PaneSide::Right);
+    let active = app.active;
+    pfnc_tui::render_panel(f, left_rect, &mut app.left, active == PaneSide::Left);
+    pfnc_tui::render_panel(f, right_rect, &mut app.right, active == PaneSide::Right);
 
     let status_text = app.status.clone().unwrap_or_default();
     f.render_widget(Paragraph::new(status_text), status_area);

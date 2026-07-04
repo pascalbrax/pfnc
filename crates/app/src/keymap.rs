@@ -15,7 +15,8 @@ use crossterm::event::KeyCode;
 
 pub const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("quit", "F10"),
-    ("edit", "F4"),
+    ("edit", "F3"),
+    ("sync", "F4"),
     ("copy", "F5"),
     ("move", "F6"),
     ("mkdir", "F7"),
@@ -103,6 +104,8 @@ mod tests {
     #[test]
     fn defaults_resolve_to_expected_keys() {
         let keymap = Keymap::default();
+        assert_eq!(keymap.action_for(KeyCode::F(3)), Some("edit"));
+        assert_eq!(keymap.action_for(KeyCode::F(4)), Some("sync"));
         assert_eq!(keymap.action_for(KeyCode::F(5)), Some("copy"));
         assert_eq!(keymap.action_for(KeyCode::F(10)), Some("quit"));
         assert_eq!(keymap.action_for(KeyCode::F(1)), None);

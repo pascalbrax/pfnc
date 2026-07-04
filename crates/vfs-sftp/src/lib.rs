@@ -12,6 +12,7 @@ pub use hostkey::{default_known_hosts_path, AcceptNewPolicy, HostKeyPolicy, Reje
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::{Duration, UNIX_EPOCH};
 
 use camino::Utf8PathBuf;
@@ -43,7 +44,17 @@ pub enum ConnectError {
 }
 
 pub struct SftpFs {
+    session: Session,
     sftp: Sftp,
+    /// Cached result of the first `quick_hash` attempt on this connection:
+    /// `Some(false)` means a prior attempt found no working `xxhsum` on the
+    /// remote host (command not found, or the exec channel itself doesn't
+    /// work on this server), so later calls skip straight to `Ok(None)`
+    /// instead of paying for a failed round trip per file. `None` means not
+    /// probed yet; `Some(true)` means it works (kept for clarity, though
+    /// nothing currently short-circuits on it — each file still needs its
+    /// own hash computed).
+    xxhsum_available: OnceLock<bool>,
 }
 
 impl std::fmt::Debug for SftpFs {
@@ -80,8 +91,44 @@ impl SftpFs {
         }
 
         let sftp = session.sftp().map_err(ConnectError::SftpInit)?;
-        Ok(Self { sftp })
+        Ok(Self {
+            session,
+            sftp,
+            xxhsum_available: OnceLock::new(),
+        })
     }
+
+    /// Runs `xxhsum -H1` on `path` via an SSH *exec* channel (not the sftp
+    /// subsystem), so only a short hex string crosses the wire rather than
+    /// the file's content. Returns `Ok(None)` — not an error — when the
+    /// command isn't found or exits non-zero (e.g. an ancient/minimal
+    /// remote without `xxhsum` installed); a real channel/connection
+    /// failure still propagates as a `VfsError`.
+    fn exec_quick_hash(&self, path: &VfsPath) -> VfsResult<Option<u64>> {
+        let mut channel = self.session.channel_session().map_err(|e| map_ssh_err(e, path))?;
+        let command = format!("xxhsum -H1 -- {}", shell_quote(path.as_str()));
+        channel.exec(&command).map_err(|e| map_ssh_err(e, path))?;
+
+        let mut stdout = String::new();
+        channel.read_to_string(&mut stdout).map_err(VfsError::Io)?;
+        channel.wait_close().map_err(|e| map_ssh_err(e, path))?;
+
+        let status = channel.exit_status().map_err(|e| map_ssh_err(e, path))?;
+        if status != 0 {
+            return Ok(None);
+        }
+
+        let hex = stdout.split_whitespace().next().unwrap_or("");
+        Ok(u64::from_str_radix(hex, 16).ok())
+    }
+}
+
+/// Single-quotes `s` for safe interpolation into a remote shell command,
+/// escaping embedded single quotes with the standard `'\''` technique.
+/// `path` values are attacker-influenced (they come from directory
+/// listings), so this must never be skipped.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 fn to_vfs_path(p: &std::path::Path) -> Option<VfsPath> {
@@ -240,5 +287,21 @@ impl Vfs for SftpFs {
 
     fn root(&self) -> VfsPath {
         VfsPath::from("/")
+    }
+
+    fn quick_hash(&self, path: &VfsPath) -> VfsResult<Option<u64>> {
+        if self.xxhsum_available.get() == Some(&false) {
+            return Ok(None);
+        }
+        match self.exec_quick_hash(path)? {
+            Some(hash) => {
+                let _ = self.xxhsum_available.set(true);
+                Ok(Some(hash))
+            }
+            None => {
+                let _ = self.xxhsum_available.set(false);
+                Ok(None)
+            }
+        }
     }
 }

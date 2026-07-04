@@ -1,4 +1,4 @@
-//! F4 "Edit": suspends the TUI, runs an external editor on the cursor
+//! F3 "Edit": suspends the TUI, runs an external editor on the cursor
 //! file, and resumes. Local files are edited in place; remote (SFTP)
 //! files are downloaded to a temp file first and only uploaded back if
 //! their content actually changed.
@@ -91,7 +91,7 @@ fn upload_temp(vfs: &dyn Vfs, local_path: &Path, remote_path: &VfsPath) -> anyho
     Ok(())
 }
 
-/// Runs the whole F4 flow: find an editor, suspend the TUI, edit (fetching
+/// Runs the whole F3 flow: find an editor, suspend the TUI, edit (fetching
 /// to / pushing from a temp file for non-local backends), resume, reload.
 pub fn edit_file(terminal: &mut ratatui::DefaultTerminal, app: &mut App, target: EditTarget, gate: &InputGate) {
     let Some(editor) = find_editor() else {

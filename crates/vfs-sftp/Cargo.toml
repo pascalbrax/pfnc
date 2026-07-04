@@ -10,6 +10,8 @@ camino = { workspace = true }
 ssh2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+xxhash-rust = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+pfnc-vfs-local = { workspace = true }

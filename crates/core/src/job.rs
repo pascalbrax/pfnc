@@ -9,15 +9,15 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, SystemTime};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use thiserror::Error;
 
-use crate::vfs::{EntryKind, EntryMeta, Vfs, VfsError, VfsPath, VfsResult};
+use crate::transport::{negotiate_transport, Transport};
+use crate::vfs::{EntryKind, EntryMeta, Location, Vfs, VfsError, VfsPath, VfsResult};
 
 pub type JobId = u64;
-
-const COPY_CHUNK_SIZE: usize = 256 * 1024;
 
 /// A cheap, clonable flag a job checks periodically so its cancellation can
 /// be requested from the UI thread without any unsafe thread interruption.
@@ -209,36 +209,61 @@ fn walk_for_delete(vfs: &dyn Vfs, path: &VfsPath, out: &mut Vec<(VfsPath, EntryM
     Ok(())
 }
 
-fn copy_stream(
-    mut reader: Box<dyn std::io::Read + Send>,
-    mut writer: Box<dyn std::io::Write + Send>,
+/// Applies one planned copy-side item (mkdir / transfer / best-effort
+/// symlink recreate) via `transport`. Shared by `copy_job` and
+/// `execute_sync_plan` so the two per-item dispatches can't drift apart.
+#[allow(clippy::too_many_arguments)]
+fn apply_copy_item(
+    src: &dyn Vfs,
+    dst: &dyn Vfs,
+    transport: &dyn Transport,
+    src_path: &VfsPath,
+    dst_path: &VfsPath,
+    meta: &EntryMeta,
     cancel: &CancellationToken,
     progress: &mut JobProgress,
     report: &dyn Fn(JobProgress),
 ) -> Result<(), JobError> {
-    let mut buf = vec![0u8; COPY_CHUNK_SIZE];
-    loop {
-        if cancel.is_cancelled() {
-            return Err(JobError::Cancelled);
+    match &meta.kind {
+        EntryKind::Dir => {
+            dst.mkdir(dst_path, meta.permissions)?;
         }
-        let n = reader.read(&mut buf).map_err(VfsError::from)?;
-        if n == 0 {
-            break;
+        EntryKind::Symlink { target: Some(target) } => {
+            // Best-effort: recreate the link rather than following it.
+            let _ = dst.symlink(target, dst_path);
         }
-        writer.write_all(&buf[..n]).map_err(VfsError::from)?;
-        progress.bytes_done += n as u64;
-        report(progress.clone());
+        EntryKind::Symlink { target: None } | EntryKind::File | EntryKind::Other => {
+            transport.transfer(src, src_path, dst, dst_path, meta.permissions, cancel, progress, report)?;
+            progress.files_done += 1;
+            report(progress.clone());
+        }
     }
-    writer.flush().map_err(VfsError::from)?;
     Ok(())
+}
+
+/// Deletes one planned entry. Shared by `delete_job` and
+/// `execute_sync_plan`'s dest-only cleanup pass.
+fn apply_delete_item(vfs: &dyn Vfs, path: &VfsPath, meta: &EntryMeta) -> VfsResult<()> {
+    if meta.kind.is_dir() {
+        vfs.remove_dir(path, false)
+    } else {
+        vfs.remove_file(path)
+    }
 }
 
 /// Copies `items` (files or directory trees) from `src` into `dest_dir` on
 /// `dst`. `src` and `dst` may be the same backend instance (the common case
-/// today) or two different ones (used from milestone M4 onward).
+/// today) or two different ones. `src_location`/`dst_location` identify
+/// the endpoints for `negotiate_transport` — today that always picks the
+/// same `Vfs`-stream transport regardless, but the parameters are here so
+/// a real fast-path negotiation can be added later without changing this
+/// function's shape.
+#[allow(clippy::too_many_arguments)]
 pub fn copy_job(
     src: &dyn Vfs,
     dst: &dyn Vfs,
+    src_location: &Location,
+    dst_location: &Location,
     items: &[VfsPath],
     dest_dir: &VfsPath,
     cancel: &CancellationToken,
@@ -263,34 +288,20 @@ pub fn copy_job(
     };
     report(progress.clone());
 
+    let transport = negotiate_transport(src_location, dst_location);
     for (src_path, dst_path, meta) in &plan {
         if cancel.is_cancelled() {
             return Err(JobError::Cancelled);
         }
         progress.current_file = Some(dst_path.clone());
-        match &meta.kind {
-            EntryKind::Dir => {
-                dst.mkdir(dst_path, meta.permissions)?;
-            }
-            EntryKind::Symlink { target: Some(target) } => {
-                // Best-effort: recreate the link rather than following it.
-                let _ = dst.symlink(target, dst_path);
-            }
-            EntryKind::Symlink { target: None } | EntryKind::File | EntryKind::Other => {
-                let reader = src.open_read(src_path)?;
-                let writer = dst.create_write(dst_path, meta.permissions)?;
-                copy_stream(reader, writer, cancel, &mut progress, report)?;
-                progress.files_done += 1;
-                report(progress.clone());
-            }
-        }
+        apply_copy_item(src, dst, transport.as_ref(), src_path, dst_path, meta, cancel, &mut progress, report)?;
     }
     Ok(())
 }
 
 /// Moves `items` to explicit destination paths on `vfs` via `rename`. Only
 /// valid when source and destination share the same backend instance —
-/// cross-backend moves (M4) compose `copy_job` + `delete_job` instead.
+/// cross-backend moves compose `copy_job` + `delete_job` instead.
 pub fn move_job(
     vfs: &dyn Vfs,
     items: &[(VfsPath, VfsPath)],
@@ -319,15 +330,18 @@ pub fn move_job(
 /// *different* backend instances — `rename` only makes sense within one
 /// backend, so this composes a copy followed by deleting the originals
 /// (only once the copy fully succeeded).
+#[allow(clippy::too_many_arguments)]
 pub fn move_cross_backend(
     src: &dyn Vfs,
     dst: &dyn Vfs,
+    src_location: &Location,
+    dst_location: &Location,
     items: &[VfsPath],
     dest_dir: &VfsPath,
     cancel: &CancellationToken,
     report: &dyn Fn(JobProgress),
 ) -> Result<(), JobError> {
-    copy_job(src, dst, items, dest_dir, cancel, report)?;
+    copy_job(src, dst, src_location, dst_location, items, dest_dir, cancel, report)?;
     delete_job(src, items, cancel, report)
 }
 
@@ -354,14 +368,296 @@ pub fn delete_job(
             return Err(JobError::Cancelled);
         }
         progress.current_file = Some(path.clone());
-        if meta.kind.is_dir() {
-            vfs.remove_dir(path, false)?;
-        } else {
-            vfs.remove_file(path)?;
-        }
+        apply_delete_item(vfs, path, meta)?;
         progress.files_done += 1;
         report(progress.clone());
     }
+    Ok(())
+}
+
+/// One item in a `SyncPlan`'s copy list: create or overwrite `dst_path`
+/// from `src_path`. `replace_existing`, when `Some`, is the entry
+/// currently at `dst_path` that must be removed first — a type mismatch
+/// (e.g. the source is now a directory where the destination has a plain
+/// file). Order matters here: `execute_sync_plan` always removes it
+/// immediately before creating the replacement, never batches it with the
+/// general dest-only cleanup pass.
+#[derive(Clone, Debug)]
+pub struct SyncCopyItem {
+    pub src_path: VfsPath,
+    pub dst_path: VfsPath,
+    pub meta: EntryMeta,
+    pub replace_existing: Option<EntryMeta>,
+}
+
+/// The result of diffing two directory trees for `sync`: what to copy and
+/// (only when the sync was started with delete-extraneous enabled) what to
+/// remove from the destination. Built by `build_sync_plan`, applied
+/// unchanged by `execute_sync_plan` — scanning never mutates anything, so
+/// the user gets a real preview before anything happens.
+#[derive(Clone, Debug, Default)]
+pub struct SyncPlan {
+    pub copy: Vec<SyncCopyItem>,
+    /// Dest-only entries, post-order (children before parents).
+    pub delete: Vec<(VfsPath, EntryMeta)>,
+    pub bytes_total: u64,
+    pub files_to_copy: usize,
+    pub items_to_delete: usize,
+}
+
+impl SyncPlan {
+    /// Nothing to do — no confirmation dialog is needed for a no-op sync.
+    pub fn is_empty(&self) -> bool {
+        self.copy.is_empty() && self.delete.is_empty()
+    }
+}
+
+/// SFTP protocol v3 mtimes only have whole-second resolution, while local
+/// filesystem mtimes are much finer, and `create_write` doesn't preserve a
+/// source's mtime on the destination — so a same-instant round trip must
+/// not be misread as "changed" by the mtime fallback below.
+const MTIME_TOLERANCE: Duration = Duration::from_secs(2);
+
+/// Whether a same-named, same-shaped file pair needs copying. Sizes differ
+/// is a cheap definitive "yes". Otherwise, a content hash on both sides
+/// (when both backends can produce one — see `Vfs::quick_hash`) is
+/// definitive either way; only when hashing isn't available on both sides
+/// do we fall back to rsync's classic "quick check" (mtime), which can
+/// occasionally miss a same-size, same-mtime content change.
+fn file_needs_copy(src: &dyn Vfs, dst: &dyn Vfs, src_entry: &EntryMeta, dst_entry: &EntryMeta) -> VfsResult<bool> {
+    if src_entry.size != dst_entry.size {
+        return Ok(true);
+    }
+    match (src.quick_hash(&src_entry.path)?, dst.quick_hash(&dst_entry.path)?) {
+        (Some(src_hash), Some(dst_hash)) => Ok(src_hash != dst_hash),
+        _ => Ok(mtime_looks_changed(src_entry.modified, dst_entry.modified)),
+    }
+}
+
+fn mtime_looks_changed(src_modified: Option<SystemTime>, dst_modified: Option<SystemTime>) -> bool {
+    match (src_modified, dst_modified) {
+        (Some(src), Some(dst)) => match src.duration_since(dst) {
+            Ok(diff) => diff > MTIME_TOLERANCE,
+            Err(_) => false, // source is not newer than destination
+        },
+        // Missing mtime info on either side means we can't tell — copy to
+        // be safe; a redundant copy is far cheaper than silently missing a
+        // real change.
+        _ => true,
+    }
+}
+
+/// Pushes `meta` (already known, e.g. from a prior `list_dir`) as a fresh
+/// create at `dst_path`, recursing into every descendant when it's a
+/// directory. Used both for entries that don't exist on the destination at
+/// all, and — via the top-level `replace_existing` — for the "new subtree
+/// created after removing an old, differently-shaped entry" case.
+fn push_full_copy(
+    src: &dyn Vfs,
+    src_path: &VfsPath,
+    dst_path: &VfsPath,
+    meta: EntryMeta,
+    replace_existing: Option<EntryMeta>,
+    plan: &mut SyncPlan,
+) -> VfsResult<()> {
+    let is_dir = meta.kind.is_dir();
+    plan.copy.push(SyncCopyItem {
+        src_path: src_path.clone(),
+        dst_path: dst_path.clone(),
+        meta,
+        replace_existing,
+    });
+    if is_dir {
+        for entry in src.list_dir(src_path)? {
+            let child_dst = dst_path.join(&entry.name);
+            let child_src = entry.path.clone();
+            push_full_copy(src, &child_src, &child_dst, entry, None, plan)?;
+        }
+    }
+    Ok(())
+}
+
+/// Classifies one name present on both sides: same-shape entries are
+/// compared/recursed, a shape mismatch (e.g. file replaced by a directory)
+/// is treated as remove-then-recreate.
+fn diff_entry(
+    src: &dyn Vfs,
+    dst: &dyn Vfs,
+    src_entry: EntryMeta,
+    dst_entry: EntryMeta,
+    dst_path: VfsPath,
+    delete_extraneous: bool,
+    plan: &mut SyncPlan,
+) -> VfsResult<()> {
+    let same_shape = matches!(
+        (&src_entry.kind, &dst_entry.kind),
+        (EntryKind::Dir, EntryKind::Dir)
+            | (EntryKind::File, EntryKind::File)
+            | (EntryKind::Symlink { .. }, EntryKind::Symlink { .. })
+            | (EntryKind::Other, EntryKind::Other)
+    );
+
+    if !same_shape {
+        let src_path = src_entry.path.clone();
+        return push_full_copy(src, &src_path, &dst_path, src_entry, Some(dst_entry), plan);
+    }
+
+    match &src_entry.kind {
+        EntryKind::Dir => diff_dir(src, dst, &src_entry.path.clone(), &dst_path, delete_extraneous, plan),
+        EntryKind::Symlink { .. } => {
+            if src_entry.kind != dst_entry.kind {
+                let src_path = src_entry.path.clone();
+                plan.copy.push(SyncCopyItem {
+                    src_path,
+                    dst_path,
+                    meta: src_entry,
+                    replace_existing: Some(dst_entry),
+                });
+            }
+            Ok(())
+        }
+        EntryKind::File => {
+            if file_needs_copy(src, dst, &src_entry, &dst_entry)? {
+                let src_path = src_entry.path.clone();
+                plan.copy.push(SyncCopyItem {
+                    src_path,
+                    dst_path,
+                    meta: src_entry,
+                    replace_existing: None,
+                });
+            }
+            Ok(())
+        }
+        EntryKind::Other => Ok(()),
+    }
+}
+
+/// Diffs `src_dir` against `dst_dir` (both already-listed directories) and
+/// recurses into shared subdirectories. Entries only on the destination
+/// are recorded for deletion (post-order, via `walk_for_delete`) only when
+/// `delete_extraneous` is set — otherwise they're simply left alone.
+fn diff_dir(
+    src: &dyn Vfs,
+    dst: &dyn Vfs,
+    src_dir: &VfsPath,
+    dst_dir: &VfsPath,
+    delete_extraneous: bool,
+    plan: &mut SyncPlan,
+) -> VfsResult<()> {
+    let src_entries = src.list_dir(src_dir)?;
+    let dst_entries = dst.list_dir(dst_dir)?;
+    let mut dst_by_name: HashMap<String, EntryMeta> = dst_entries.into_iter().map(|e| (e.name.clone(), e)).collect();
+
+    for src_entry in src_entries {
+        let dst_path = dst_dir.join(&src_entry.name);
+        match dst_by_name.remove(&src_entry.name) {
+            None => {
+                let src_path = src_entry.path.clone();
+                push_full_copy(src, &src_path, &dst_path, src_entry, None, plan)?;
+            }
+            Some(dst_entry) => {
+                diff_entry(src, dst, src_entry, dst_entry, dst_path, delete_extraneous, plan)?;
+            }
+        }
+    }
+
+    if delete_extraneous {
+        for leftover in dst_by_name.into_values() {
+            walk_for_delete(dst, &leftover.path, &mut plan.delete)?;
+        }
+    }
+    Ok(())
+}
+
+/// Computes what a sync of `src_root` (on `src`) into `dst_root` (on
+/// `dst`) would do, without changing anything — so the caller can show the
+/// user a preview before committing via `execute_sync_plan`. See
+/// `file_needs_copy` for the comparison rule and `diff_entry` for how
+/// type/shape mismatches are handled.
+pub fn build_sync_plan(
+    src: &dyn Vfs,
+    dst: &dyn Vfs,
+    src_root: &VfsPath,
+    dst_root: &VfsPath,
+    delete_extraneous: bool,
+    cancel: &CancellationToken,
+    report: &dyn Fn(JobProgress),
+) -> Result<SyncPlan, JobError> {
+    if cancel.is_cancelled() {
+        return Err(JobError::Cancelled);
+    }
+
+    let mut plan = SyncPlan::default();
+    diff_dir(src, dst, src_root, dst_root, delete_extraneous, &mut plan)?;
+
+    plan.files_to_copy = plan.copy.iter().filter(|i| !i.meta.kind.is_dir()).count();
+    plan.bytes_total = plan.copy.iter().filter(|i| !i.meta.kind.is_dir()).map(|i| i.meta.size).sum();
+    plan.items_to_delete = plan.delete.len();
+
+    report(JobProgress {
+        files_total: plan.files_to_copy,
+        bytes_total: plan.bytes_total,
+        ..Default::default()
+    });
+    Ok(plan)
+}
+
+/// Applies a `SyncPlan` computed by `build_sync_plan`: copies/replaces
+/// first (so a type-mismatch replacement's removal always happens right
+/// before its recreation, never batched with the general cleanup pass),
+/// then removes dest-only entries post-order.
+pub fn execute_sync_plan(
+    src: &dyn Vfs,
+    dst: &dyn Vfs,
+    src_location: &Location,
+    dst_location: &Location,
+    plan: &SyncPlan,
+    cancel: &CancellationToken,
+    report: &dyn Fn(JobProgress),
+) -> Result<(), JobError> {
+    let transport = negotiate_transport(src_location, dst_location);
+    let mut progress = JobProgress {
+        files_total: plan.files_to_copy,
+        bytes_total: plan.bytes_total,
+        ..Default::default()
+    };
+    report(progress.clone());
+
+    for item in &plan.copy {
+        if cancel.is_cancelled() {
+            return Err(JobError::Cancelled);
+        }
+        if let Some(old) = &item.replace_existing {
+            if old.kind.is_dir() {
+                dst.remove_dir(&item.dst_path, true)?;
+            } else {
+                dst.remove_file(&item.dst_path)?;
+            }
+        }
+        progress.current_file = Some(item.dst_path.clone());
+        apply_copy_item(
+            src,
+            dst,
+            transport.as_ref(),
+            &item.src_path,
+            &item.dst_path,
+            &item.meta,
+            cancel,
+            &mut progress,
+            report,
+        )?;
+    }
+
+    for (path, meta) in &plan.delete {
+        if cancel.is_cancelled() {
+            return Err(JobError::Cancelled);
+        }
+        progress.current_file = Some(path.clone());
+        apply_delete_item(dst, path, meta)?;
+        progress.files_done += 1;
+        report(progress.clone());
+    }
+
     Ok(())
 }
 

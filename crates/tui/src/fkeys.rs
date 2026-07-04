@@ -4,7 +4,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 const LABELS: [&str; 10] = [
-    "Help", "Menu", "View", "Edit", "Copy", "Move", "MkDir", "Delete", "Connect", "Quit",
+    "Help", "Menu", "Edit", "Sync", "Copy", "Move", "MkDir", "Delete", "Connect", "Quit",
 ];
 
 /// Renders the MC-style bottom function-key bar, e.g. `F5 Copy  F6 Move ...`.

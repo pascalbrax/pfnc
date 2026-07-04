@@ -7,7 +7,7 @@ use std::fs;
 
 use camino::Utf8PathBuf;
 use pfnc_core::job::{copy_job, delete_job, move_job, CancellationToken, JobProgress};
-use pfnc_core::{Vfs, VfsPath};
+use pfnc_core::{Location, Vfs, VfsPath};
 use pfnc_vfs_local::LocalFs;
 use tempfile::tempdir;
 
@@ -34,7 +34,17 @@ fn copy_job_copies_file_and_directory_tree() {
     vfs.mkdir(&dest_dir, None).unwrap();
 
     let cancel = CancellationToken::new();
-    copy_job(&vfs, &vfs, std::slice::from_ref(&src_dir), &dest_dir, &cancel, &noop_report).unwrap();
+    copy_job(
+        &vfs,
+        &vfs,
+        &Location::Local,
+        &Location::Local,
+        std::slice::from_ref(&src_dir),
+        &dest_dir,
+        &cancel,
+        &noop_report,
+    )
+    .unwrap();
 
     let copied_a = dest_dir.join("src/a.txt");
     let copied_b = dest_dir.join("src/nested/b.txt");
@@ -58,7 +68,7 @@ fn copy_job_reports_progress_and_totals() {
     let cancel = CancellationToken::new();
     let last = RefCell::new(JobProgress::default());
     let report = |p: JobProgress| *last.borrow_mut() = p;
-    copy_job(&vfs, &vfs, &[file], &dest_dir, &cancel, &report).unwrap();
+    copy_job(&vfs, &vfs, &Location::Local, &Location::Local, &[file], &dest_dir, &cancel, &report).unwrap();
 
     let last = last.into_inner();
     assert_eq!(last.files_total, 1);
@@ -80,7 +90,8 @@ fn copy_job_respects_cancellation() {
 
     let cancel = CancellationToken::new();
     cancel.cancel();
-    let err = copy_job(&vfs, &vfs, &[file], &dest_dir, &cancel, &noop_report).unwrap_err();
+    let err = copy_job(&vfs, &vfs, &Location::Local, &Location::Local, &[file], &dest_dir, &cancel, &noop_report)
+        .unwrap_err();
     assert!(matches!(err, pfnc_core::job::JobError::Cancelled));
 }
 

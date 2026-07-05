@@ -18,6 +18,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         Mode::TextInput(prompt) => handle_text_input_key(app, prompt, key.code),
         Mode::Connect(form) => handle_connect_key(app, form, key.code),
         Mode::Progress(state) => handle_progress_key(app, state, key.code),
+        // Already reset to `Mode::Browsing` above; any key dismisses it.
+        Mode::Help => {}
     }
 }
 
@@ -56,6 +58,10 @@ fn handle_browsing_key(app: &mut App, key: KeyCode) {
             }
             "sync" => {
                 start_sync(app);
+                return;
+            }
+            "help" => {
+                app.mode = Mode::Help;
                 return;
             }
             _ => {}
@@ -139,12 +145,19 @@ fn ascend(app: &mut App) {
         if let Location::Archive { base, archive_path } = &app.active_panel().location {
             let new_location = (**base).clone();
             let new_cwd = archive_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| VfsPath::from("/"));
+            // The archive file itself is what we're "leaving" here, so the
+            // cursor should land on it in the parent listing, same as the
+            // generic directory case below.
+            let archive_name = archive_path.file_name().map(str::to_string);
             let panel = app.active_panel_mut();
             panel.location = new_location;
             panel.cwd = new_cwd;
             panel.cursor = 0;
             let registry = Arc::clone(&app.registry);
             reload(&registry, app.active_panel_mut());
+            if let Some(name) = archive_name {
+                app.active_panel_mut().select_by_name(&name);
+            }
             return;
         }
     }
@@ -152,10 +165,16 @@ fn ascend(app: &mut App) {
     let panel = app.active_panel_mut();
     if let Some(parent) = panel.cwd.parent().map(|p| p.to_path_buf()) {
         if parent != panel.cwd {
+            // Midnight-Commander behavior: land the cursor back on the
+            // directory we just came from, not at the top of the listing.
+            let left_name = panel.cwd.file_name().map(str::to_string);
             panel.cwd = parent;
             panel.cursor = 0;
             let registry = Arc::clone(&app.registry);
             reload(&registry, app.active_panel_mut());
+            if let Some(name) = left_name {
+                app.active_panel_mut().select_by_name(&name);
+            }
         }
     }
 }

@@ -1,2 +1,7 @@
 /target
 *.log
+
+# Placeholder agent crates are excluded from the main workspace, so cargo
+# gives each its own independent target dir.
+/crates/agent-macos/target
+/crates/agent-bsd/target

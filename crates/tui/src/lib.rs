@@ -7,7 +7,7 @@ mod fkeys;
 mod layout;
 mod panel;
 
-pub use dialog::{centered_rect, render_confirm, render_connect, render_progress, render_text_input};
+pub use dialog::{centered_rect, render_confirm, render_connect, render_help, render_progress, render_text_input};
 pub use fkeys::render_fkey_bar;
 pub use layout::{split_main, split_panels};
 pub use panel::render_panel;
@@ -87,6 +87,40 @@ mod tests {
         assert!(rendered.contains("Copy"));
         assert!(rendered.contains("F8"));
         assert!(rendered.contains("Delete"));
+    }
+
+    #[test]
+    fn local_and_remote_panels_show_distinct_connection_symbols() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut left = sample_panel(); // Location::Local
+        let mut right = sample_panel();
+        right.location = Location::Remote { profile_id: "user@host:22".to_string() };
+
+        terminal
+            .draw(|f| {
+                let (panels_area, _status, _fkeys) = split_main(f.area());
+                let (left_rect, right_rect) = split_panels(panels_area);
+                render_panel(f, left_rect, &mut left, true);
+                render_panel(f, right_rect, &mut right, false);
+            })
+            .unwrap();
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains('⌂'), "local panel should show the local glyph");
+        assert!(rendered.contains('⇄'), "remote panel should show the remote glyph");
+    }
+
+    #[test]
+    fn renders_help_with_github_url() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| render_help(f, f.area())).unwrap();
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("pfnc"));
+        assert!(rendered.contains("github.com/pascalbrax"));
     }
 
     fn panel_with_many_entries(count: usize, cursor: usize) -> PanelState {

@@ -35,6 +35,22 @@ pub fn render_confirm(f: &mut Frame<'_>, area: Rect, dialog: &ConfirmDialog) {
     f.render_widget(Paragraph::new(text).block(block), rect);
 }
 
+/// The F1 "About" box: three lines about the tool, the project's GitHub
+/// URL, and a dismiss hint. Dismissed by any key (see `actions::handle_key`).
+pub fn render_help(f: &mut Frame<'_>, area: Rect) {
+    let rect = centered_rect(60, 30, area);
+    f.render_widget(Clear, rect);
+    let block = Block::default().borders(Borders::ALL).title(" About pfnc ");
+    let text = "pfnc — dual-pane file manager for local + SSH/SFTP\n\
+                Directory sync, archive browsing (tar/zip), TOFU host keys\n\
+                Built with Rust, ratatui, and libssh2\n\
+                \n\
+                https://github.com/pascalbrax\n\
+                \n\
+                [any key] Close";
+    f.render_widget(Paragraph::new(text).block(block), rect);
+}
+
 pub fn render_text_input(f: &mut Frame<'_>, area: Rect, prompt: &TextInputPrompt) {
     let rect = centered_rect(70, 20, area);
     f.render_widget(Clear, rect);

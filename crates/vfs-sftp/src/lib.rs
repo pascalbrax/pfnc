@@ -4,9 +4,11 @@
 //! widest range of real-world SSH servers.
 
 mod auth;
+mod deploy;
 mod hostkey;
 
 pub use auth::AuthMethod;
+pub use deploy::{deploy_and_start, kill_remote_process, DeployError, DeployedAgent};
 pub use hostkey::{default_known_hosts_path, AcceptNewPolicy, HostKeyPolicy, RejectUnknownPolicy};
 
 use std::io::{Read, Write};
@@ -190,7 +192,9 @@ impl Vfs for SftpFs {
             }
             out.push(meta);
         }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
+        // Directories first (Midnight-Commander-style), alphabetical within
+        // each group.
+        out.sort_by(|a, b| b.kind.is_dir().cmp(&a.kind.is_dir()).then_with(|| a.name.cmp(&b.name)));
         Ok(out)
     }
 

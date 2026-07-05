@@ -88,7 +88,9 @@ impl Vfs for LocalFs {
             };
             out.push(entry_meta_from_std(&full, name, &meta));
         }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
+        // Directories first (Midnight-Commander-style), alphabetical within
+        // each group.
+        out.sort_by(|a, b| b.kind.is_dir().cmp(&a.kind.is_dir()).then_with(|| a.name.cmp(&b.name)));
         Ok(out)
     }
 
@@ -188,6 +190,24 @@ mod tests {
 
     fn vfs_path(p: &std::path::Path) -> VfsPath {
         Utf8PathBuf::from_path_buf(p.to_path_buf()).expect("tempdir path must be UTF-8")
+    }
+
+    #[test]
+    fn list_dir_sorts_directories_before_files() {
+        let dir = tempdir().unwrap();
+        let root = vfs_path(dir.path());
+
+        // Named so alphabetical-only sorting would interleave them.
+        fs::write(dir.path().join("a_file.txt"), b"x").unwrap();
+        fs::create_dir(dir.path().join("z_dir")).unwrap();
+        fs::write(dir.path().join("m_file.txt"), b"x").unwrap();
+        fs::create_dir(dir.path().join("b_dir")).unwrap();
+
+        let fs_impl = LocalFs::new();
+        let entries = fs_impl.list_dir(&root).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+
+        assert_eq!(names, vec!["b_dir", "z_dir", "a_file.txt", "m_file.txt"]);
     }
 
     #[test]

@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# Placeholder Phase 3 agent crates for OSes we're not building on yet (see
+# crates/agent-macos, crates/agent-bsd) — kept out of the default
+# `--workspace` build/test set; still buildable individually via
+# `cargo build -p pfnc-agent-macos` etc.
+exclude = ["crates/agent-macos", "crates/agent-bsd"]
 
 [workspace.package]
 edition = "2021"
@@ -13,6 +18,7 @@ pfnc-vfs-sftp = { path = "crates/vfs-sftp" }
 pfnc-vfs-archive = { path = "crates/vfs-archive" }
 pfnc-config = { path = "crates/config" }
 pfnc-tui = { path = "crates/tui" }
+pfnc-agent-linux = { path = "crates/agent-linux" }
 
 ratatui = "0.29"
 crossterm = "0.28"
@@ -33,3 +39,7 @@ directories = "5"
 crossbeam-channel = "0.5"
 tempfile = "3"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23.41", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rcgen = "0.14.7"
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "net", "time"] }

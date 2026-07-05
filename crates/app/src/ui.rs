@@ -23,5 +23,6 @@ pub fn render(f: &mut Frame<'_>, app: &mut App) {
         Mode::TextInput(prompt) => pfnc_tui::render_text_input(f, f.area(), prompt),
         Mode::Connect(form) => pfnc_tui::render_connect(f, f.area(), form),
         Mode::Progress(state) => pfnc_tui::render_progress(f, f.area(), state),
+        Mode::Help => pfnc_tui::render_help(f, f.area()),
     }
 }

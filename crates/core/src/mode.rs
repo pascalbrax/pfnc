@@ -16,6 +16,8 @@ pub enum Mode {
     TextInput(TextInputPrompt),
     Connect(ConnectForm),
     Progress(ProgressState),
+    /// The F1 "About" box. No state of its own — dismissed by any key.
+    Help,
 }
 
 #[derive(Clone, Debug)]

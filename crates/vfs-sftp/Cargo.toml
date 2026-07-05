@@ -15,3 +15,5 @@ xxhash-rust = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 pfnc-vfs-local = { workspace = true }
+pfnc-agent-linux = { workspace = true }
+tokio = { workspace = true }

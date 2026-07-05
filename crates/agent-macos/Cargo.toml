@@ -1,0 +1,8 @@
+[package]
+name = "pfnc-agent-macos"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "pfnc-agent"
+path = "src/main.rs"

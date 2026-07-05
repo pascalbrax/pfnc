@@ -19,6 +19,24 @@ fn location_label(location: &Location) -> String {
     }
 }
 
+/// A one-glyph connection-type indicator, shown before the location label
+/// so it's visible at a glance which panels are local vs. remote. An
+/// archive's symbol reflects whatever it's layered over (e.g. an archive
+/// opened from a remote host still shows the remote glyph), matching
+/// `location_label`'s own recursion.
+///
+/// Only two states exist today: real Phase 3 work (see `roadmap.md`)
+/// hasn't wired a QUIC-backed transport into any live connection yet —
+/// `Location::Remote` is always an SFTP connection. A third glyph for a
+/// QUIC-fast-pathed connection belongs here once that's real, not before.
+fn location_symbol(location: &Location) -> &'static str {
+    match location {
+        Location::Local => "⌂",
+        Location::Remote { .. } => "⇄",
+        Location::Archive { base, .. } => location_symbol(base),
+    }
+}
+
 fn format_size(size: u64, kind: &EntryKind) -> String {
     if kind.is_dir() {
         return "<DIR>".to_string();
@@ -71,7 +89,7 @@ pub fn render_panel(f: &mut Frame<'_>, area: Rect, panel: &mut PanelState, is_ac
         Style::default()
     };
 
-    let title = format!(" {}:{} ", location_label(&panel.location), panel.cwd);
+    let title = format!(" {} {}:{} ", location_symbol(&panel.location), location_label(&panel.location), panel.cwd);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)

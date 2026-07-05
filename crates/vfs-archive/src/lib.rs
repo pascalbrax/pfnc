@@ -83,7 +83,7 @@ impl Vfs for ArchiveFs {
         if path != "/" {
             self.find(path)?;
         }
-        let out = self
+        let mut out: Vec<EntryMeta> = self
             .entries
             .iter()
             .filter(|e| {
@@ -102,6 +102,9 @@ impl Vfs for ArchiveFs {
                 group: None,
             })
             .collect();
+        // Directories first (Midnight-Commander-style), alphabetical within
+        // each group.
+        out.sort_by(|a, b| b.kind.is_dir().cmp(&a.kind.is_dir()).then_with(|| a.name.cmp(&b.name)));
         Ok(out)
     }
 

@@ -50,6 +50,16 @@ impl PanelState {
         self.cursor = next as usize;
     }
 
+    /// Moves the cursor onto the entry named `name`, if present — used
+    /// after reloading a parent directory so the cursor lands back on the
+    /// child just left, Midnight-Commander-style, rather than resetting to
+    /// the top. Leaves `cursor` untouched if no entry matches.
+    pub fn select_by_name(&mut self, name: &str) {
+        if let Some(index) = self.entries.iter().position(|e| e.name == name) {
+            self.cursor = index;
+        }
+    }
+
     /// Clamp the cursor after `entries` changes (e.g. after a reload),
     /// so a panel that shrank doesn't leave a stale out-of-range cursor.
     pub fn clamp_cursor(&mut self) {

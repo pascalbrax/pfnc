@@ -51,6 +51,18 @@ fn f10_quits_like_q_and_esc() {
 }
 
 #[test]
+fn f1_opens_help_and_any_key_dismisses_it() {
+    let dir = tempdir().unwrap();
+    let mut app = App::new(vfs_path(dir.path()));
+
+    press(&mut app, KeyCode::F(1));
+    assert!(matches!(app.mode, Mode::Help));
+
+    press(&mut app, KeyCode::Char('x'));
+    assert!(matches!(app.mode, Mode::Browsing), "any key should dismiss the help box");
+}
+
+#[test]
 fn session_restore_uses_saved_local_cwd_when_it_still_exists() {
     let dir = tempdir().unwrap();
     let saved_dir = dir.path().join("saved");
@@ -199,13 +211,14 @@ fn extract_file_out_of_archive_via_copy() {
     fs::create_dir(dir.path().join("dest")).unwrap();
 
     let mut app = App::new(root.clone());
+    // Entries sorted folders-first: dest(0), backup.tar(1).
+    press(&mut app, KeyCode::Down); // onto backup.tar
     press(&mut app, KeyCode::Enter); // open backup.tar
     wait_for_job_to_finish(&mut app);
     press(&mut app, KeyCode::Enter); // descend into inner/
 
-    // Right panel -> dest (entries sorted: backup.tar(0), dest(1)).
+    // Right panel -> dest (cursor already on it, folders sort first).
     press(&mut app, KeyCode::Tab);
-    press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Tab); // back to the archive panel
 
@@ -269,6 +282,28 @@ fn page_down_and_page_up_move_by_a_full_screen() {
         press(&mut app, KeyCode::PageDown);
     }
     assert_eq!(app.left.cursor, 19);
+}
+
+#[test]
+fn ascend_restores_cursor_to_the_directory_just_left() {
+    let dir = tempdir().unwrap();
+    let root = vfs_path(dir.path());
+    fs::create_dir(dir.path().join("a")).unwrap();
+    fs::create_dir(dir.path().join("b")).unwrap();
+    fs::create_dir(dir.path().join("c")).unwrap();
+
+    let mut app = App::new(root);
+    // Entries sorted: a(0), b(1), c(2).
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.left.cursor, 2);
+    press(&mut app, KeyCode::Enter); // descend into "c"
+
+    press(&mut app, KeyCode::Backspace); // ascend back up
+    assert_eq!(
+        app.left.entries[app.left.cursor].name, "c",
+        "Midnight-Commander behavior: cursor should land back on the folder just left, not reset to the top"
+    );
 }
 
 #[test]

@@ -27,7 +27,7 @@ fn run_sync(
 ) -> pfnc_core::SyncPlan {
     let cancel = CancellationToken::new();
     let plan = build_sync_plan(vfs, vfs, src_root, dst_root, delete_extraneous, &cancel, &noop_report).unwrap();
-    execute_sync_plan(vfs, vfs, &Location::Local, &Location::Local, &plan, &cancel, &noop_report).unwrap();
+    execute_sync_plan(vfs, vfs, &Location::Local, &Location::Local, &plan, false, &cancel, &noop_report).unwrap();
     plan
 }
 

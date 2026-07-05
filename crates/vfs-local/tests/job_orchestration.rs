@@ -41,6 +41,7 @@ fn copy_job_copies_file_and_directory_tree() {
         &Location::Local,
         std::slice::from_ref(&src_dir),
         &dest_dir,
+        false,
         &cancel,
         &noop_report,
     )
@@ -68,7 +69,7 @@ fn copy_job_reports_progress_and_totals() {
     let cancel = CancellationToken::new();
     let last = RefCell::new(JobProgress::default());
     let report = |p: JobProgress| *last.borrow_mut() = p;
-    copy_job(&vfs, &vfs, &Location::Local, &Location::Local, &[file], &dest_dir, &cancel, &report).unwrap();
+    copy_job(&vfs, &vfs, &Location::Local, &Location::Local, &[file], &dest_dir, false, &cancel, &report).unwrap();
 
     let last = last.into_inner();
     assert_eq!(last.files_total, 1);
@@ -90,8 +91,9 @@ fn copy_job_respects_cancellation() {
 
     let cancel = CancellationToken::new();
     cancel.cancel();
-    let err = copy_job(&vfs, &vfs, &Location::Local, &Location::Local, &[file], &dest_dir, &cancel, &noop_report)
-        .unwrap_err();
+    let err =
+        copy_job(&vfs, &vfs, &Location::Local, &Location::Local, &[file], &dest_dir, false, &cancel, &noop_report)
+            .unwrap_err();
     assert!(matches!(err, pfnc_core::job::JobError::Cancelled));
 }
 

@@ -6,6 +6,7 @@
 mod auth;
 mod deploy;
 mod hostkey;
+mod quic_agent;
 
 pub use auth::AuthMethod;
 pub use deploy::{deploy_and_start, kill_remote_process, DeployError, DeployedAgent};
@@ -14,11 +15,15 @@ pub use hostkey::{default_known_hosts_path, AcceptNewPolicy, HostKeyPolicy, Reje
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
 
 use camino::Utf8PathBuf;
-use pfnc_core::{EntryKind, EntryMeta, ProfileId, Vfs, VfsCapabilities, VfsError, VfsPath, VfsResult};
+use pfnc_core::{
+    ConnectionInfo, EntryKind, EntryMeta, ProfileId, QuicConnectionInfo, RemoteFileAgent, Vfs, VfsCapabilities,
+    VfsError, VfsPath, VfsResult,
+};
+use quic_agent::QuicAgentHandle;
 use ssh2::{OpenFlags, OpenType, Session, Sftp};
 use thiserror::Error;
 
@@ -48,6 +53,10 @@ pub enum ConnectError {
 pub struct SftpFs {
     session: Session,
     sftp: Sftp,
+    /// The remote host to dial for the QUIC fast path — not otherwise
+    /// needed since `session`/`sftp` are already connected, but `quic_agent`
+    /// has to know where to send its own, separate UDP connection.
+    host: String,
     /// Cached result of the first `quick_hash` attempt on this connection:
     /// `Some(false)` means a prior attempt found no working `xxhsum` on the
     /// remote host (command not found, or the exec channel itself doesn't
@@ -57,6 +66,17 @@ pub struct SftpFs {
     /// nothing currently short-circuits on it — each file still needs its
     /// own hash computed).
     xxhsum_available: OnceLock<bool>,
+    /// Cached result of the first `fast_transport` attempt — `None` means
+    /// either not probed yet, or a prior attempt failed (unsupported remote
+    /// OS, deployment failure, handshake failure); either way, later calls
+    /// don't retry a doomed connection once per file. See `quic_agent`.
+    quic_agent_cache: OnceLock<Option<Arc<QuicAgentHandle>>>,
+    /// Cached `uname -s` probe of the remote host, trimmed — `None` means
+    /// either not probed yet or the probe failed. Populated by
+    /// `warm_remote_os_probe` (and reused by the QUIC deploy decision, see
+    /// `quic_agent.rs`) so it's never fetched more than once per
+    /// connection, and exposed for display via `connection_info`.
+    remote_os_cache: OnceLock<Option<String>>,
 }
 
 impl std::fmt::Debug for SftpFs {
@@ -96,7 +116,10 @@ impl SftpFs {
         Ok(Self {
             session,
             sftp,
+            host: profile.host.clone(),
             xxhsum_available: OnceLock::new(),
+            quic_agent_cache: OnceLock::new(),
+            remote_os_cache: OnceLock::new(),
         })
     }
 
@@ -306,6 +329,35 @@ impl Vfs for SftpFs {
                 let _ = self.xxhsum_available.set(false);
                 Ok(None)
             }
+        }
+    }
+
+    fn fast_transport(&self) -> Option<Arc<dyn RemoteFileAgent>> {
+        self.quic_agent().map(|handle| handle as Arc<dyn RemoteFileAgent>)
+    }
+
+    fn connection_info(&self) -> Option<ConnectionInfo> {
+        // Only ever peeks already-warmed caches (`.get()`, never
+        // `.get_or_init()`) — this must be safe to call from UI-thread
+        // rendering code, never trigger a fresh probe or QUIC deployment.
+        let remote_os = self.remote_os_cache.get().cloned().flatten();
+        let quic = self.quic_agent_cache.get().cloned().flatten().map(|agent| QuicConnectionInfo {
+            local_port: agent.local_port(),
+            remote_port: agent.remote_port(),
+            agent_pid: agent.pid(),
+        });
+        Some(ConnectionInfo { protocol: "SFTP", remote_os, quic })
+    }
+}
+
+impl Drop for SftpFs {
+    /// If a QUIC agent was successfully deployed on this connection, kill
+    /// the remote `pfnc-agent` process before this `SftpFs` (and its exec
+    /// channel keeping the process alive) goes away — otherwise it would be
+    /// left running on the remote host indefinitely.
+    fn drop(&mut self) {
+        if let Some(agent) = self.quic_agent_cache.get().and_then(|cached| cached.clone()) {
+            let _ = kill_remote_process(self, agent.pid());
         }
     }
 }

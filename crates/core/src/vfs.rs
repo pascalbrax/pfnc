@@ -3,10 +3,13 @@
 //! archive.
 
 use std::io::{Read, Write};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use camino::Utf8PathBuf;
 use thiserror::Error;
+
+use crate::transport::RemoteFileAgent;
 
 /// A path within a single backend's namespace. Always UTF-8.
 ///
@@ -91,6 +94,35 @@ pub struct VfsCapabilities {
     pub can_rename: bool,
 }
 
+/// Diagnostic info about a connection, for display purposes only (e.g. the
+/// F1 Help box) — never consulted by any transfer-path decision, so it's
+/// safe to construct from whatever's already cached without triggering new
+/// network I/O. Plain enough types (`String`/`u16`/`u32`) that `pfnc-core`
+/// still doesn't need to depend on `quinn`/`ssh2` to define this.
+#[derive(Clone, Debug)]
+pub struct ConnectionInfo {
+    /// The protocol actually moving directory listings and most file
+    /// operations for this connection, e.g. `"SFTP"`.
+    pub protocol: &'static str,
+    /// The remote host's OS (e.g. `Some("Linux")`), from a `uname -s`
+    /// probe — `None` if that probe hasn't completed yet or failed.
+    pub remote_os: Option<String>,
+    /// Present only when a QUIC fast-path agent is actually connected.
+    pub quic: Option<QuicConnectionInfo>,
+}
+
+/// Details about an active QUIC fast-path connection, for display only.
+#[derive(Clone, Debug)]
+pub struct QuicConnectionInfo {
+    /// This process's own local UDP port for the connection, when known.
+    pub local_port: Option<u16>,
+    /// The port the remote `pfnc-agent` is listening on.
+    pub remote_port: u16,
+    /// PID of the `pfnc-agent` process listening on `remote_port` — "who
+    /// is listening" on the remote host.
+    pub agent_pid: u32,
+}
+
 /// A backend implementing filesystem-like operations. Implemented once per
 /// backend (`LocalFs`, `SftpFs`, `ArchiveFs`); panels only ever talk to a
 /// `dyn Vfs`, never to a concrete backend type.
@@ -132,5 +164,24 @@ pub trait Vfs: Send + Sync {
     /// it can compute the hash *on the remote host* via an exec channel.
     fn quick_hash(&self, _path: &VfsPath) -> VfsResult<Option<u64>> {
         Ok(None)
+    }
+
+    /// This backend's own fast whole-file read/write channel, when it has
+    /// one (e.g. an already-deployed QUIC agent for `SftpFs`) — used by
+    /// `negotiate_transport` to pick a faster `Transport` than the generic
+    /// `Vfs`-stream copy. `None` (the default) means no such channel exists;
+    /// callers must fall back to the generic stream transport in that case,
+    /// never treat `None` as an error.
+    fn fast_transport(&self) -> Option<Arc<dyn RemoteFileAgent>> {
+        None
+    }
+
+    /// Diagnostic info about this connection for display purposes (e.g.
+    /// the F1 Help box). `None` (the default) means nothing interesting to
+    /// show — used by `LocalFs`/`ArchiveFs`. Implementations must only
+    /// report already-cached facts, never probe fresh over the network:
+    /// this can be called from UI-thread rendering code.
+    fn connection_info(&self) -> Option<ConnectionInfo> {
+        None
     }
 }

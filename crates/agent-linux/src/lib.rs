@@ -1,11 +1,11 @@
-//! The Linux `pfnc-agent`: proves the Phase 3 QUIC fast-path mechanism (a
-//! self-signed cert plus a version handshake) end to end. This is
-//! deliberately the *first* increment of Phase 3 — see the module docs on
-//! `pfnc_core::transport` for the bigger picture. Not yet wired into
-//! anything: no SSH-based deployment, no real file-transfer protocol, and
-//! `pfnc-core`'s `negotiate_transport` still always returns the plain
-//! SFTP/local-stream transport. This crate doesn't depend on `pfnc-core`
-//! at all — nothing here is reachable from the main app yet.
+//! The Linux `pfnc-agent`: a standalone QUIC server serving the Phase 3
+//! fast-path mechanism — a self-signed cert, a version handshake, and a
+//! streaming file-transfer protocol (read/write a file by path in bounded
+//! chunks, never buffering a whole file in memory). Deployed and driven by
+//! `pfnc-vfs-sftp`'s `SftpFs::fast_transport`, which is what `pfnc-core`'s
+//! `negotiate_transport` calls into for a Local<->Remote(SFTP) transfer —
+//! see the module docs on `pfnc_core::transport` for the bigger picture.
+//! This crate itself doesn't depend on `pfnc-core` at all.
 //!
 //! Why async/tokio here when the rest of the app is deliberately
 //! thread-per-job, no-async (see `crates/core/src/job.rs`)? Because this
@@ -13,15 +13,31 @@
 //! *remote* host, never linked into the `pfnc` TUI binary — so an async
 //! runtime here doesn't touch that rule at all.
 
+mod protocol;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use protocol::{
+    read_string, read_u32, read_u8, write_bytes, write_string, write_u32, write_u8, OP_HELLO, OP_READ_FILE,
+    OP_WRITE_FILE,
+};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// Bumped whenever the wire format of the hello exchange below changes.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Bumped whenever the wire format (see `protocol` module docs) changes.
+/// `2`: `read_file`/`write_file` content dropped its `u64` size prefix in
+/// favor of streaming until the sending side's `send.finish()` — see
+/// `protocol`'s module docs.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Bound on how much file content is held in memory at once by
+/// `read_file`/`write_file` (both client and agent side) — chosen to match
+/// `pfnc_core::transport`'s own `COPY_CHUNK_SIZE`, though this crate has no
+/// dependency on `pfnc-core` to share the constant with.
+const CHUNK_SIZE: usize = 256 * 1024;
 
 /// Generates a fresh, ephemeral self-signed certificate for one agent
 /// process's lifetime.
@@ -30,7 +46,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// over the (already-authenticated) SSH control channel rather than
 /// trusting any certificate authority — that negotiation doesn't exist
 /// yet, so today only this crate's own tests exercise the pinning path
-/// (see `connect_and_hello` below).
+/// (see `connect` below).
 pub fn generate_self_signed_cert() -> anyhow::Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
     let cert_key = rcgen::generate_simple_self_signed(vec!["pfnc-agent".to_string()])?;
     let cert_der = cert_key.cert.der().clone();
@@ -51,9 +67,10 @@ pub fn bind_server(
     Ok(endpoint)
 }
 
-/// Accepts connections on `endpoint` and handles each with the version
-/// handshake, forever — there's no shutdown signal yet, so callers spawn
-/// this in a background task rather than awaiting it directly.
+/// Accepts connections on `endpoint` forever — there's no shutdown signal
+/// yet, so callers spawn this in a background task rather than awaiting
+/// it directly. Each connection can serve many requests over its
+/// lifetime (see `handle_connection`), not just one.
 pub async fn serve(endpoint: quinn::Endpoint) {
     while let Some(incoming) = endpoint.accept().await {
         tokio::spawn(async move {
@@ -64,32 +81,113 @@ pub async fn serve(endpoint: quinn::Endpoint) {
     }
 }
 
+/// Accepts bidirectional streams on one connection for as long as it stays
+/// open, spawning a handler per stream — QUIC's whole strength is cheap,
+/// multiplexed streams on one connection, so a real client issues many
+/// requests (hello once, then any number of file reads/writes) without
+/// reconnecting. The loop exits on its own once the peer closes the
+/// connection (`accept_bi` then returns an error).
 async fn handle_connection(incoming: quinn::Incoming) -> anyhow::Result<()> {
     let connection = incoming.await?;
-    let (mut send, mut recv) = connection.accept_bi().await?;
+    while let Ok((send, recv)) = connection.accept_bi().await {
+        tokio::spawn(async move {
+            if let Err(e) = handle_stream(send, recv).await {
+                eprintln!("pfnc-agent: stream error: {e:#}");
+            }
+        });
+    }
+    Ok(())
+}
 
-    let mut client_version_bytes = [0u8; 4];
-    recv.read_exact(&mut client_version_bytes).await?;
-    let client_version = u32::from_le_bytes(client_version_bytes);
+async fn handle_stream(mut send: quinn::SendStream, mut recv: quinn::RecvStream) -> anyhow::Result<()> {
+    let opcode = read_u8(&mut recv).await?;
+    match opcode {
+        OP_HELLO => handle_hello(&mut send, &mut recv).await,
+        OP_READ_FILE => handle_read_file(&mut send, &mut recv).await,
+        OP_WRITE_FILE => handle_write_file(&mut send, &mut recv).await,
+        other => anyhow::bail!("unknown opcode {other}"),
+    }
+}
+
+async fn handle_hello(send: &mut quinn::SendStream, recv: &mut quinn::RecvStream) -> anyhow::Result<()> {
+    let client_version = read_u32(recv).await?;
     let compatible = client_version == PROTOCOL_VERSION;
-
-    let mut response = Vec::with_capacity(5);
-    response.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-    response.push(compatible as u8);
-    send.write_all(&response).await?;
+    write_u32(send, PROTOCOL_VERSION).await?;
+    write_u8(send, compatible as u8).await?;
     send.finish()?;
+    Ok(())
+}
 
-    // Wait for the client to explicitly close (after it's read our
-    // response) rather than dropping our `connection` handle here —
-    // dropping it force-closes the connection immediately, which can race
-    // ahead of the just-finished stream's data actually being delivered.
-    connection.closed().await;
+/// Serves a file's content from the agent's own local filesystem — this
+/// *is* the "serve file operations on the machine the agent runs on"
+/// logic the whole deployment mechanism exists for. Streams in `CHUNK_SIZE`
+/// pieces directly from disk rather than reading the whole file into
+/// memory first.
+async fn handle_read_file(send: &mut quinn::SendStream, recv: &mut quinn::RecvStream) -> anyhow::Result<()> {
+    let path = read_string(recv).await?;
+    match tokio::fs::File::open(&path).await {
+        Ok(mut file) => {
+            write_u8(send, 1).await?;
+            let mut buf = vec![0u8; CHUNK_SIZE];
+            loop {
+                let n = file.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                send.write_all(&buf[..n]).await?;
+            }
+        }
+        Err(e) => {
+            write_u8(send, 0).await?;
+            write_bytes(send, e.to_string().as_bytes()).await?;
+        }
+    }
+    send.finish()?;
+    Ok(())
+}
+
+async fn handle_write_file(send: &mut quinn::SendStream, recv: &mut quinn::RecvStream) -> anyhow::Result<()> {
+    let path = read_string(recv).await?;
+    let mode = if read_u8(recv).await? != 0 { Some(read_u32(recv).await?) } else { None };
+
+    match write_local_file_streaming(&path, mode, recv).await {
+        Ok(()) => write_u8(send, 1).await?,
+        Err(e) => {
+            write_u8(send, 0).await?;
+            write_bytes(send, e.to_string().as_bytes()).await?;
+        }
+    }
+    send.finish()?;
+    Ok(())
+}
+
+/// Creates/truncates `path` and streams `recv`'s remaining content into it
+/// in `CHUNK_SIZE` pieces (the peer signals "done" by calling
+/// `send.finish()` on its side, which surfaces here as `recv.read`
+/// returning `None`), rather than reading it all into memory first.
+async fn write_local_file_streaming(path: &str, mode: Option<u32>, recv: &mut quinn::RecvStream) -> anyhow::Result<()> {
+    let mut file = tokio::fs::File::create(path).await?;
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    while let Some(n) = recv.read(&mut buf).await? {
+        file.write_all(&buf[..n]).await?;
+    }
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).await?;
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
     Ok(())
 }
 
 /// Connects to `server_addr` trusting *only* `pinned_cert_der` (byte-for-byte
-/// — no certificate authority involved), sends `client_version` as the
-/// hello, and returns the agent's reported `(version, compatible)`.
+/// — no certificate authority involved). Returns the still-open
+/// `Endpoint`/`Connection` pair — the `Endpoint` must outlive the
+/// `Connection` for as long as it's used, and the caller decides when to
+/// close (`connection.close(...)`, then `endpoint.wait_idle().await`)
+/// since one connection can now serve several requests (`hello`,
+/// `read_file`, `write_file`) before that.
 ///
 /// Takes the cert as raw DER bytes rather than `rustls`'s `CertificateDer`
 /// so callers outside this crate (e.g. `pfnc-vfs-sftp`'s deployment code,
@@ -100,12 +198,11 @@ async fn handle_connection(incoming: quinn::Incoming) -> anyhow::Result<()> {
 /// do; that negotiation doesn't exist yet, so callers (today, only this
 /// crate's tests and `pfnc-vfs-sftp`'s deployment test) must already know
 /// the exact cert to pin.
-pub async fn connect_and_hello(
+pub async fn connect(
     server_addr: SocketAddr,
     server_name: &str,
     pinned_cert_der: &[u8],
-    client_version: u32,
-) -> anyhow::Result<(u32, bool)> {
+) -> anyhow::Result<(quinn::Endpoint, quinn::Connection)> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = Arc::new(PinnedCertVerifier {
         expected: CertificateDer::from(pinned_cert_der.to_vec()),
@@ -121,26 +218,99 @@ pub async fn connect_and_hello(
     let quic_client_config = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_config)?;
     let client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
 
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+    // The local endpoint's bind address family must match `server_addr`'s —
+    // an IPv4-bound UDP socket can't target an IPv6 destination (and vice
+    // versa). Real LAN hosts increasingly resolve to IPv6 (SLAAC/ULA
+    // addresses), so this can't just hardcode "0.0.0.0:0".
+    let bind_addr: SocketAddr = if server_addr.is_ipv6() { "[::]:0".parse()? } else { "0.0.0.0:0".parse()? };
+    let mut endpoint = quinn::Endpoint::client(bind_addr)?;
     endpoint.set_default_client_config(client_config);
 
     let connection = endpoint.connect(server_addr, server_name)?.await?;
-    let (mut send, mut recv) = connection.open_bi().await?;
+    Ok((endpoint, connection))
+}
 
-    send.write_all(&client_version.to_le_bytes()).await?;
+/// Sends `client_version` as a hello on a fresh stream, returning the
+/// agent's reported `(version, compatible)`.
+pub async fn hello(connection: &quinn::Connection, client_version: u32) -> anyhow::Result<(u32, bool)> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    write_u8(&mut send, OP_HELLO).await?;
+    write_u32(&mut send, client_version).await?;
     send.finish()?;
 
-    let mut response = [0u8; 5];
-    recv.read_exact(&mut response).await?;
-    let server_version = u32::from_le_bytes(response[0..4].try_into().expect("4-byte slice"));
-    let compatible = response[4] != 0;
-
-    // Explicitly close now that we've read the full response — the
-    // server waits for this (see `handle_connection`) instead of racing
-    // its own handle's drop against delivery of the just-finished stream.
-    connection.close(0u32.into(), b"done");
-    endpoint.wait_idle().await;
+    let server_version = read_u32(&mut recv).await?;
+    let compatible = read_u8(&mut recv).await? != 0;
     Ok((server_version, compatible))
+}
+
+/// Reads the content of `path` from the agent's local filesystem, calling
+/// `on_chunk` with each chunk as it arrives (bounded by an internal
+/// `CHUNK_SIZE` buffer — never the whole file at once). Returns the total
+/// number of bytes read on success.
+pub async fn read_file(
+    connection: &quinn::Connection,
+    path: &str,
+    mut on_chunk: impl FnMut(&[u8]) -> std::io::Result<()>,
+) -> anyhow::Result<u64> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    write_u8(&mut send, OP_READ_FILE).await?;
+    write_string(&mut send, path).await?;
+    send.finish()?;
+
+    if read_u8(&mut recv).await? == 0 {
+        let msg = read_string(&mut recv).await?;
+        anyhow::bail!("agent read_file failed: {msg}");
+    }
+
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut total = 0u64;
+    while let Some(n) = recv.read(&mut buf).await? {
+        on_chunk(&buf[..n])?;
+        total += n as u64;
+    }
+    Ok(total)
+}
+
+/// Writes `path` on the agent's local filesystem by repeatedly calling
+/// `next_chunk` (same shape as `Read::read`: fill the buffer, return the
+/// number of bytes filled, `0` means done) until exhausted, optionally
+/// setting Unix permission bits via `mode`. Returns the total number of
+/// bytes written on success.
+pub async fn write_file(
+    connection: &quinn::Connection,
+    path: &str,
+    mode: Option<u32>,
+    mut next_chunk: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
+) -> anyhow::Result<u64> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    write_u8(&mut send, OP_WRITE_FILE).await?;
+    write_string(&mut send, path).await?;
+    match mode {
+        Some(m) => {
+            write_u8(&mut send, 1).await?;
+            write_u32(&mut send, m).await?;
+        }
+        None => write_u8(&mut send, 0).await?,
+    }
+
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut total = 0u64;
+    loop {
+        let n = next_chunk(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        send.write_all(&buf[..n]).await?;
+        total += n as u64;
+    }
+    send.finish()?;
+
+    if read_u8(&mut recv).await? != 0 {
+        Ok(total)
+    } else {
+        let msg = read_string(&mut recv).await?;
+        anyhow::bail!("agent write_file failed: {msg}")
+    }
 }
 
 /// A `rustls::client::danger::ServerCertVerifier` that trusts exactly one

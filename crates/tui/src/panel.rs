@@ -20,20 +20,23 @@ fn location_label(location: &Location) -> String {
 }
 
 /// A one-glyph connection-type indicator, shown before the location label
-/// so it's visible at a glance which panels are local vs. remote. An
-/// archive's symbol reflects whatever it's layered over (e.g. an archive
-/// opened from a remote host still shows the remote glyph), matching
-/// `location_label`'s own recursion.
-///
-/// Only two states exist today: real Phase 3 work (see `roadmap.md`)
-/// hasn't wired a QUIC-backed transport into any live connection yet —
-/// `Location::Remote` is always an SFTP connection. A third glyph for a
-/// QUIC-fast-pathed connection belongs here once that's real, not before.
-fn location_symbol(location: &Location) -> &'static str {
+/// so it's visible at a glance which panels are local, plain-SFTP remote,
+/// or a QUIC-fast-pathed remote. An archive's symbol reflects whatever it's
+/// layered over (e.g. an archive opened from a remote host still shows that
+/// host's glyph), matching `location_label`'s own recursion. `quic_available`
+/// comes from `PanelState::quic_available` — set once at connect time from
+/// the already-cached `Vfs::fast_transport()` result, not recomputed here.
+fn location_symbol(location: &Location, quic_available: bool) -> &'static str {
     match location {
         Location::Local => "⌂",
-        Location::Remote { .. } => "⇄",
-        Location::Archive { base, .. } => location_symbol(base),
+        Location::Remote { .. } => {
+            if quic_available {
+                "⚡"
+            } else {
+                "⇄"
+            }
+        }
+        Location::Archive { base, .. } => location_symbol(base, quic_available),
     }
 }
 
@@ -89,7 +92,12 @@ pub fn render_panel(f: &mut Frame<'_>, area: Rect, panel: &mut PanelState, is_ac
         Style::default()
     };
 
-    let title = format!(" {} {}:{} ", location_symbol(&panel.location), location_label(&panel.location), panel.cwd);
+    let title = format!(
+        " {} {}:{} ",
+        location_symbol(&panel.location, panel.quic_available),
+        location_label(&panel.location),
+        panel.cwd
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)

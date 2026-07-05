@@ -2,7 +2,7 @@ use pfnc_core::Mode;
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::app::{App, PaneSide};
+use crate::app::{connection_info_for, App, PaneSide};
 
 pub fn render(f: &mut Frame<'_>, app: &mut App) {
     let (panels_area, status_area, fkeys_area) = pfnc_tui::split_main(f.area());
@@ -23,6 +23,9 @@ pub fn render(f: &mut Frame<'_>, app: &mut App) {
         Mode::TextInput(prompt) => pfnc_tui::render_text_input(f, f.area(), prompt),
         Mode::Connect(form) => pfnc_tui::render_connect(f, f.area(), form),
         Mode::Progress(state) => pfnc_tui::render_progress(f, f.area(), state),
-        Mode::Help => pfnc_tui::render_help(f, f.area()),
+        Mode::Help => {
+            let connection = connection_info_for(&app.registry, &app.active_panel().location);
+            pfnc_tui::render_help(f, f.area(), connection.as_ref());
+        }
     }
 }

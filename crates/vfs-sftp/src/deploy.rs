@@ -74,12 +74,39 @@ pub fn deploy_and_start(
     channel.exec(&command).map_err(DeployError::Exec)?;
 
     let mut reader = std::io::BufReader::new(channel);
+    let deployed = parse_startup_lines(&mut reader)?;
+    // Reclaim the `Channel` (discarding any buffered leftover bytes — there
+    // shouldn't be any, since the agent writes nothing else to stdout after
+    // its three startup lines) so the caller can keep it open and running.
+    let channel = reader.into_inner();
+
+    Ok((deployed, channel))
+}
+
+/// Reads `pfnc-agent`'s three `PFNC-AGENT-*` startup lines from `reader`,
+/// identifying each by its prefix rather than assuming they're exactly the
+/// first three lines read. Real-world `sshd`/shell configs sometimes write
+/// something of their own to stdout before the command's own output even
+/// for a plain exec channel (a MOTD, a security banner, a shell wrapper) —
+/// any such line is skipped (logged at `debug`, not treated as an error)
+/// rather than failing the whole deployment. Bounded by
+/// `MAX_STARTUP_LINES` so a remote that never actually produces the
+/// expected output (wrong binary, immediate crash) still fails promptly
+/// instead of hanging.
+fn parse_startup_lines(reader: &mut impl BufRead) -> Result<DeployedAgent, DeployError> {
+    const MAX_STARTUP_LINES: usize = 50;
     let mut pid = None;
     let mut port = None;
     let mut cert_der = None;
-    for _ in 0..3 {
+    for _ in 0..MAX_STARTUP_LINES {
+        if pid.is_some() && port.is_some() && cert_der.is_some() {
+            break;
+        }
         let mut line = String::new();
-        reader.read_line(&mut line).map_err(DeployError::ReadOutput)?;
+        let bytes_read = reader.read_line(&mut line).map_err(DeployError::ReadOutput)?;
+        if bytes_read == 0 {
+            break; // EOF: the process exited before producing everything expected.
+        }
         let line = line.trim();
         if let Some(value) = line.strip_prefix("PFNC-AGENT-PID ") {
             pid = value
@@ -93,20 +120,18 @@ pub fn deploy_and_start(
                 .map(Some)?;
         } else if let Some(value) = line.strip_prefix("PFNC-AGENT-CERT-HEX ") {
             cert_der = Some(from_hex(value).map_err(|e| DeployError::MalformedOutput(format!("bad cert hex: {e}")))?);
-        } else {
-            return Err(DeployError::MalformedOutput(format!("unexpected startup line: {line:?}")));
+        } else if !line.is_empty() {
+            tracing::debug!(line, "ignoring unexpected output before pfnc-agent's own startup lines");
         }
     }
-    // Reclaim the `Channel` (discarding any buffered leftover bytes — there
-    // shouldn't be any, since the agent writes nothing else to stdout after
-    // its three startup lines) so the caller can keep it open and running.
-    let channel = reader.into_inner();
 
     let (Some(pid), Some(port), Some(cert_der)) = (pid, port, cert_der) else {
-        return Err(DeployError::MalformedOutput("missing one or more expected startup lines".to_string()));
+        return Err(DeployError::MalformedOutput(
+            "missing one or more expected startup lines (agent likely failed to start)".to_string(),
+        ));
     };
 
-    Ok((DeployedAgent { pid, port, cert_der }, channel))
+    Ok(DeployedAgent { pid, port, cert_der })
 }
 
 /// Kills the remote process `pid` via a separate, fresh exec channel —
@@ -152,5 +177,61 @@ mod tests {
     #[test]
     fn from_hex_rejects_non_hex_chars() {
         assert!(from_hex("zz").is_err());
+    }
+
+    fn deployed(pid: u32, port: u16, hex: &str) -> String {
+        format!("PFNC-AGENT-PID {pid}\nPFNC-AGENT-PORT {port}\nPFNC-AGENT-CERT-HEX {hex}\n")
+    }
+
+    #[test]
+    fn parse_startup_lines_reads_exactly_the_three_expected_lines() {
+        let input = deployed(123, 4433, "00abff");
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let agent = parse_startup_lines(&mut reader).unwrap();
+        assert_eq!(agent.pid, 123);
+        assert_eq!(agent.port, 4433);
+        assert_eq!(agent.cert_der, vec![0x00, 0xab, 0xff]);
+    }
+
+    #[test]
+    fn parse_startup_lines_tolerates_a_shell_motd_banner_first() {
+        // Real-world sshd/shell configs can write a banner before the
+        // command's own output even on a plain exec channel — this must
+        // not be treated as a fatal "unexpected startup line" error.
+        let input = format!(
+            "Welcome to Ubuntu 22.04.3 LTS\n\n\
+             {}",
+            deployed(456, 9999, "1234")
+        );
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let agent = parse_startup_lines(&mut reader).unwrap();
+        assert_eq!(agent.pid, 456);
+        assert_eq!(agent.port, 9999);
+        assert_eq!(agent.cert_der, vec![0x12, 0x34]);
+    }
+
+    #[test]
+    fn parse_startup_lines_tolerates_the_three_lines_out_of_order() {
+        let input = "PFNC-AGENT-PORT 9999\nPFNC-AGENT-CERT-HEX ab\nPFNC-AGENT-PID 456\n";
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let agent = parse_startup_lines(&mut reader).unwrap();
+        assert_eq!(agent.pid, 456);
+        assert_eq!(agent.port, 9999);
+        assert_eq!(agent.cert_der, vec![0xab]);
+    }
+
+    #[test]
+    fn parse_startup_lines_errors_cleanly_on_eof_before_all_three_arrive() {
+        let mut reader = std::io::BufReader::new("PFNC-AGENT-PID 123\n".as_bytes());
+        assert!(parse_startup_lines(&mut reader).is_err());
+    }
+
+    #[test]
+    fn parse_startup_lines_errors_rather_than_hanging_on_endless_junk() {
+        // 200 blank-ish junk lines, well past MAX_STARTUP_LINES, and never
+        // any of the real startup lines — must still terminate.
+        let input = "some banner line\n".repeat(200);
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        assert!(parse_startup_lines(&mut reader).is_err());
     }
 }

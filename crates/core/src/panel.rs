@@ -21,6 +21,14 @@ pub struct PanelState {
     /// (i.e. excluding borders/title). Updated by `sync_viewport`; lets
     /// PageUp/PageDown jump by a full screen instead of a fixed guess.
     pub viewport_height: usize,
+    /// Whether this panel's connection (if remote) has a QUIC fast-path
+    /// agent available — set once by the app layer right after a connect
+    /// (or archive-open) job completes, from the already-cached result of
+    /// `Vfs::fast_transport()`, never recomputed on every render. Always
+    /// `false` for `Location::Local`. Purely a UI hint (which glyph
+    /// `pfnc-tui` shows); `negotiate_transport` makes its own independent
+    /// decision at transfer time.
+    pub quic_available: bool,
 }
 
 impl PanelState {
@@ -33,6 +41,7 @@ impl PanelState {
             cursor: 0,
             scroll_offset: 0,
             viewport_height: 0,
+            quic_available: false,
         }
     }
 

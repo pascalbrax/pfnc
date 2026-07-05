@@ -253,11 +253,10 @@ fn apply_delete_item(vfs: &dyn Vfs, path: &VfsPath, meta: &EntryMeta) -> VfsResu
 
 /// Copies `items` (files or directory trees) from `src` into `dest_dir` on
 /// `dst`. `src` and `dst` may be the same backend instance (the common case
-/// today) or two different ones. `src_location`/`dst_location` identify
-/// the endpoints for `negotiate_transport` — today that always picks the
-/// same `Vfs`-stream transport regardless, but the parameters are here so
-/// a real fast-path negotiation can be added later without changing this
-/// function's shape.
+/// today) or two different ones. `src_location`/`dst_location` identify the
+/// endpoints for `negotiate_transport`, which picks a faster path than the
+/// generic `Vfs`-stream transport when `enable_quic_fast_path` is set and
+/// one side offers one (see `pfnc_core::transport`).
 #[allow(clippy::too_many_arguments)]
 pub fn copy_job(
     src: &dyn Vfs,
@@ -266,6 +265,7 @@ pub fn copy_job(
     dst_location: &Location,
     items: &[VfsPath],
     dest_dir: &VfsPath,
+    enable_quic_fast_path: bool,
     cancel: &CancellationToken,
     report: &dyn Fn(JobProgress),
 ) -> Result<(), JobError> {
@@ -288,7 +288,7 @@ pub fn copy_job(
     };
     report(progress.clone());
 
-    let transport = negotiate_transport(src_location, dst_location);
+    let transport = negotiate_transport(src_location, dst_location, src, dst, enable_quic_fast_path);
     for (src_path, dst_path, meta) in &plan {
         if cancel.is_cancelled() {
             return Err(JobError::Cancelled);
@@ -338,10 +338,11 @@ pub fn move_cross_backend(
     dst_location: &Location,
     items: &[VfsPath],
     dest_dir: &VfsPath,
+    enable_quic_fast_path: bool,
     cancel: &CancellationToken,
     report: &dyn Fn(JobProgress),
 ) -> Result<(), JobError> {
-    copy_job(src, dst, src_location, dst_location, items, dest_dir, cancel, report)?;
+    copy_job(src, dst, src_location, dst_location, items, dest_dir, enable_quic_fast_path, cancel, report)?;
     delete_job(src, items, cancel, report)
 }
 
@@ -606,16 +607,18 @@ pub fn build_sync_plan(
 /// first (so a type-mismatch replacement's removal always happens right
 /// before its recreation, never batched with the general cleanup pass),
 /// then removes dest-only entries post-order.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_sync_plan(
     src: &dyn Vfs,
     dst: &dyn Vfs,
     src_location: &Location,
     dst_location: &Location,
     plan: &SyncPlan,
+    enable_quic_fast_path: bool,
     cancel: &CancellationToken,
     report: &dyn Fn(JobProgress),
 ) -> Result<(), JobError> {
-    let transport = negotiate_transport(src_location, dst_location);
+    let transport = negotiate_transport(src_location, dst_location, src, dst, enable_quic_fast_path);
     let mut progress = JobProgress {
         files_total: plan.files_to_copy,
         bytes_total: plan.bytes_total,

@@ -10,7 +10,7 @@ use pfnc_vfs_sftp::{deploy_and_start, kill_remote_process, AcceptNewPolicy, Sftp
 use support::TestSshd;
 
 /// `pfnc-agent-linux` is a dev-dependency of this crate (for its
-/// `connect_and_hello` test helper below), but `CARGO_BIN_EXE_<name>` is
+/// `connect`/`hello` test helpers below), but `CARGO_BIN_EXE_<name>` is
 /// only set for a crate's *own* binary targets, not a dependency's — so we
 /// locate the just-built `pfnc-agent` binary relative to this test
 /// binary's own path instead: both land in the same `target/<profile>/`
@@ -21,6 +21,19 @@ fn agent_binary_path() -> std::path::PathBuf {
     let path = target_dir.join("pfnc-agent");
     assert!(path.exists(), "expected agent binary at {path:?} (build pfnc-agent-linux first)");
     path
+}
+
+async fn hello_over_quic(deployed: &pfnc_vfs_sftp::DeployedAgent) -> anyhow::Result<(u32, bool)> {
+    let (endpoint, connection) = pfnc_agent_linux::connect(
+        format!("127.0.0.1:{}", deployed.port).parse()?,
+        "pfnc-agent",
+        &deployed.cert_der,
+    )
+    .await?;
+    let hello = pfnc_agent_linux::hello(&connection, pfnc_agent_linux::PROTOCOL_VERSION).await?;
+    connection.close(0u32.into(), b"done");
+    endpoint.wait_idle().await;
+    Ok(hello)
 }
 
 #[test]
@@ -34,12 +47,7 @@ fn deploy_uploads_execs_and_a_real_quic_handshake_succeeds() {
         deploy_and_start(&vfs, &agent_binary_path(), remote_dir.to_str().unwrap()).expect("deploy_and_start");
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let result = runtime.block_on(pfnc_agent_linux::connect_and_hello(
-        format!("127.0.0.1:{}", deployed.port).parse().unwrap(),
-        "pfnc-agent",
-        &deployed.cert_der,
-        pfnc_agent_linux::PROTOCOL_VERSION,
-    ));
+    let result = runtime.block_on(hello_over_quic(&deployed));
 
     kill_remote_process(&vfs, deployed.pid).expect("kill_remote_process");
 

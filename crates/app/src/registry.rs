@@ -54,9 +54,21 @@ impl VfsRegistry {
     /// Performs the actual (blocking, network) SSH connect and, on
     /// success, caches the resulting backend under `profile.id`. Callers
     /// run this on a background job thread, never the UI thread.
+    ///
+    /// Also warms the remote-OS probe (one cheap exec-channel round trip)
+    /// so it's available for display (F1 Help) as soon as the connection
+    /// exists. Deliberately does *not* touch `Vfs::fast_transport()` here —
+    /// that first probe deploys and connects a real QUIC agent (on the
+    /// order of a second, or much longer if it's failing and hitting
+    /// timeouts), which would make every Connect feel slow regardless of
+    /// whether the fast path ends up usable. Callers that want the QUIC
+    /// fast path warm should do it as a separate, later background job
+    /// once the panel is already browsable (see `actions::submit_connect`'s
+    /// use of `App::background_jobs`), not as part of this call.
     pub fn connect_and_cache(&self, profile: &ConnectionProfile) -> Result<(), ConnectError> {
         let known_hosts = pfnc_vfs_sftp::default_known_hosts_path();
         let sftp = SftpFs::connect(profile, &AcceptNewPolicy, &known_hosts)?;
+        sftp.warm_remote_os_probe();
         self.remotes.lock().unwrap().insert(profile.id.clone(), Arc::new(sftp));
         Ok(())
     }

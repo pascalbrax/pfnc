@@ -3,7 +3,7 @@ use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph};
 use ratatui::Frame;
 
-use pfnc_core::{ConfirmDialog, ConnectForm, ProgressState, TextInputPrompt};
+use pfnc_core::{ConfirmDialog, ConnectForm, ConnectionInfo, ProgressState, TextInputPrompt};
 
 /// A `Rect` centered within `area`, `percent_x`/`percent_y` of its size —
 /// the standard ratatui popup-dialog idiom.
@@ -36,18 +36,37 @@ pub fn render_confirm(f: &mut Frame<'_>, area: Rect, dialog: &ConfirmDialog) {
 }
 
 /// The F1 "About" box: three lines about the tool, the project's GitHub
-/// URL, and a dismiss hint. Dismissed by any key (see `actions::handle_key`).
-pub fn render_help(f: &mut Frame<'_>, area: Rect) {
-    let rect = centered_rect(60, 30, area);
+/// URL, connection diagnostics for the active panel (when it's remote —
+/// see `connection`), and a dismiss hint. Dismissed by any key (see
+/// `actions::handle_key`).
+pub fn render_help(f: &mut Frame<'_>, area: Rect, connection: Option<&ConnectionInfo>) {
+    let rect = centered_rect(64, 60, area);
     f.render_widget(Clear, rect);
     let block = Block::default().borders(Borders::ALL).title(" About pfnc ");
-    let text = "pfnc — dual-pane file manager for local + SSH/SFTP\n\
-                Directory sync, archive browsing (tar/zip), TOFU host keys\n\
-                Built with Rust, ratatui, and libssh2\n\
-                \n\
-                https://github.com/pascalbrax\n\
-                \n\
-                [any key] Close";
+
+    let mut text = "pfnc — dual-pane file manager for local + SSH/SFTP\n\
+                     Directory sync, archive browsing (tar/zip), TOFU host keys\n\
+                     Built with Rust, ratatui, and libssh2\n\
+                     \n\
+                     https://github.com/pascalbrax\n"
+        .to_string();
+
+    if let Some(info) = connection {
+        text.push_str(&format!("Active panel connection: {}\n", info.protocol));
+        text.push_str(&format!("Remote OS: {}\n", info.remote_os.as_deref().unwrap_or("unknown")));
+        match &info.quic {
+            Some(quic) => {
+                let local = quic.local_port.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string());
+                text.push_str("QUIC fast path: enabled\n");
+                text.push_str(&format!("  local port {local} <-> remote port {}\n", quic.remote_port));
+                text.push_str(&format!("  listening: pfnc-agent (pid {})\n", quic.agent_pid));
+            }
+            None => text.push_str("QUIC fast path: not available for this connection\n"),
+        }
+    }
+
+    text.push_str("[any key] Close");
+
     f.render_widget(Paragraph::new(text).block(block), rect);
 }
 

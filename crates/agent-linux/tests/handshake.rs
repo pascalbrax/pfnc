@@ -1,7 +1,7 @@
 //! End-to-end test of the Phase 3 QUIC handshake mechanism: a real
 //! in-process `quinn` server and a real `quinn` client, no mocking.
 
-use pfnc_agent_linux::{bind_server, connect_and_hello, generate_self_signed_cert, serve, PROTOCOL_VERSION};
+use pfnc_agent_linux::{bind_server, connect, generate_self_signed_cert, hello, serve, PROTOCOL_VERSION};
 
 #[tokio::test]
 async fn handshake_succeeds_with_matching_protocol_version() {
@@ -11,12 +11,14 @@ async fn handshake_succeeds_with_matching_protocol_version() {
     let addr = endpoint.local_addr().unwrap();
     tokio::spawn(serve(endpoint));
 
-    let (server_version, compatible) = connect_and_hello(addr, "pfnc-agent", cert_for_client.as_ref(), PROTOCOL_VERSION)
-        .await
-        .unwrap();
+    let (client_endpoint, connection) = connect(addr, "pfnc-agent", cert_for_client.as_ref()).await.unwrap();
+    let (server_version, compatible) = hello(&connection, PROTOCOL_VERSION).await.unwrap();
 
     assert_eq!(server_version, PROTOCOL_VERSION);
     assert!(compatible);
+
+    connection.close(0u32.into(), b"done");
+    client_endpoint.wait_idle().await;
 }
 
 #[tokio::test]
@@ -28,14 +30,16 @@ async fn handshake_reports_incompatible_on_version_mismatch() {
     tokio::spawn(serve(endpoint));
 
     let bogus_version = PROTOCOL_VERSION + 999;
-    let (server_version, compatible) = connect_and_hello(addr, "pfnc-agent", cert_for_client.as_ref(), bogus_version)
-        .await
-        .unwrap();
+    let (client_endpoint, connection) = connect(addr, "pfnc-agent", cert_for_client.as_ref()).await.unwrap();
+    let (server_version, compatible) = hello(&connection, bogus_version).await.unwrap();
 
     // The connection itself must still succeed — a version mismatch is
     // reported in the response, not treated as a handshake failure.
     assert_eq!(server_version, PROTOCOL_VERSION, "server always reports its own version");
     assert!(!compatible, "mismatched version must not be reported compatible");
+
+    connection.close(0u32.into(), b"done");
+    client_endpoint.wait_idle().await;
 }
 
 #[tokio::test]
@@ -50,6 +54,6 @@ async fn wrong_pinned_cert_is_rejected() {
     // outright, exactly like real SSH-negotiated pinning eventually would
     // if an agent's cert didn't match what was negotiated.
     let (wrong_cert, _wrong_key) = generate_self_signed_cert().unwrap();
-    let result = connect_and_hello(addr, "pfnc-agent", wrong_cert.as_ref(), PROTOCOL_VERSION).await;
+    let result = connect(addr, "pfnc-agent", wrong_cert.as_ref()).await;
     assert!(result.is_err(), "connecting with the wrong pinned cert must fail");
 }

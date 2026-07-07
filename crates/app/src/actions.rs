@@ -8,7 +8,9 @@ use pfnc_core::{
 };
 use pfnc_vfs_sftp::{AuthMethod, ConnectionProfile};
 
-use crate::app::{reload, selected_items, App, PaneSide};
+use crate::app::{
+    quic_available_for, reload, selected_items, update_quic_available_for_profile, App, BackgroundJob, PaneSide,
+};
 use crate::editor::EditTarget;
 
 pub fn handle_key(app: &mut App, key: KeyEvent) {
@@ -340,10 +342,20 @@ fn start_sync(app: &mut App) {
 
 fn spawn_execute_sync(app: &mut App, plan: pfnc_core::SyncPlan, src_location: Location, dst_location: Location) {
     let registry = Arc::clone(&app.registry);
+    let enable_quic_fast_path = app.config.general.enable_quic_fast_path;
     let job_id = app.jobs.spawn("Sync", move |cancel, report| {
         let src = registry.resolve(&src_location)?;
         let dst = registry.resolve(&dst_location)?;
-        job::execute_sync_plan(src.as_ref(), dst.as_ref(), &src_location, &dst_location, &plan, cancel, report)
+        job::execute_sync_plan(
+            src.as_ref(),
+            dst.as_ref(),
+            &src_location,
+            &dst_location,
+            &plan,
+            enable_quic_fast_path,
+            cancel,
+            report,
+        )
     });
     app.mode = Mode::Progress(ProgressState {
         job_id,
@@ -447,8 +459,19 @@ fn spawn_copy(app: &mut App, items: Vec<VfsPath>, dest_dir: VfsPath) {
         }
     };
 
+    let enable_quic_fast_path = app.config.general.enable_quic_fast_path;
     let job_id = app.jobs.spawn("Copy", move |cancel, report| {
-        job::copy_job(src.as_ref(), dst.as_ref(), &src_location, &dst_location, &items, &dest_dir, cancel, report)
+        job::copy_job(
+            src.as_ref(),
+            dst.as_ref(),
+            &src_location,
+            &dst_location,
+            &items,
+            &dest_dir,
+            enable_quic_fast_path,
+            cancel,
+            report,
+        )
     });
     app.mode = Mode::Progress(ProgressState {
         job_id,
@@ -499,6 +522,7 @@ fn spawn_move_to_dir(app: &mut App, items: Vec<VfsPath>, dest_dir: VfsPath) {
             return;
         }
     };
+    let enable_quic_fast_path = app.config.general.enable_quic_fast_path;
     let job_id = app.jobs.spawn("Move", move |cancel, report| {
         job::move_cross_backend(
             src.as_ref(),
@@ -507,6 +531,7 @@ fn spawn_move_to_dir(app: &mut App, items: Vec<VfsPath>, dest_dir: VfsPath) {
             &dst_location,
             &items,
             &dest_dir,
+            enable_quic_fast_path,
             cancel,
             report,
         )
@@ -609,9 +634,7 @@ fn submit_connect(app: &mut App, mut form: ConnectForm) {
     let registry = Arc::clone(&app.registry);
     let job_id = app.jobs.spawn("Connect", move |_cancel, report| {
         report(Default::default());
-        registry
-            .connect_and_cache(&profile)
-            .map_err(|e| pfnc_core::VfsError::ConnectionLost(e.to_string()).into())
+        registry.connect_and_cache(&profile).map_err(|e| pfnc_core::VfsError::ConnectionLost(e.to_string()).into())
     });
     app.mode = Mode::Progress(ProgressState {
         job_id,
@@ -639,6 +662,21 @@ pub fn handle_job_event(app: &mut App, event: JobEvent) {
         }
         JobEvent::Finished { job_id, outcome } => {
             app.jobs.reap(job_id);
+
+            // A background job (see `BackgroundJob`) never took over the
+            // UI, so its completion shouldn't touch `app.mode`/`app.status`
+            // either, regardless of whether it succeeded — handle it here
+            // and return before any of the `Mode::Progress`-based logic
+            // below, which doesn't apply to it at all.
+            if let Some(background) = app.background_jobs.remove(&job_id) {
+                match background {
+                    BackgroundJob::WarmQuicFastPath { profile_id } => {
+                        update_quic_available_for_profile(app, &profile_id);
+                    }
+                }
+                return;
+            }
+
             let current = match &app.mode {
                 Mode::Progress(state) if state.job_id == job_id => Some(state.kind.clone()),
                 _ => None,
@@ -671,10 +709,29 @@ pub fn handle_job_event(app: &mut App, event: JobEvent) {
                         });
 
                         let panel = if target_left { &mut app.left } else { &mut app.right };
-                        panel.location = Location::Remote { profile_id: profile.id };
+                        panel.location = Location::Remote { profile_id: profile.id.clone() };
                         panel.cwd = VfsPath::from("/");
                         panel.cursor = 0;
+                        panel.quic_available = quic_available_for(&app.registry, &panel.location);
                         reload(&app.registry, panel);
+
+                        // Deliberately not part of `connect_and_cache` itself
+                        // (see its docs) — the first real probe deploys and
+                        // connects a QUIC agent, which can take a second or
+                        // much longer if it's failing, so it runs as its own
+                        // silent background job once the panel above is
+                        // already browsable, rather than blocking Connect.
+                        if app.config.general.enable_quic_fast_path {
+                            let registry = Arc::clone(&app.registry);
+                            let location = Location::Remote { profile_id: profile.id.clone() };
+                            let job_id = app.jobs.spawn("Warm QUIC fast path", move |_cancel, _report| {
+                                if let Ok(vfs) = registry.resolve(&location) {
+                                    let _ = vfs.fast_transport();
+                                }
+                                Ok(())
+                            });
+                            app.background_jobs.insert(job_id, BackgroundJob::WarmQuicFastPath { profile_id: profile.id });
+                        }
                     }
                 }
                 JobKind::OpenArchive { target_left, location } => {
@@ -683,6 +740,7 @@ pub fn handle_job_event(app: &mut App, event: JobEvent) {
                         panel.location = location;
                         panel.cwd = VfsPath::from("/");
                         panel.cursor = 0;
+                        panel.quic_available = quic_available_for(&app.registry, &panel.location);
                         reload(&app.registry, panel);
                     }
                 }

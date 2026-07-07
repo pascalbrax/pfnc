@@ -16,5 +16,8 @@ pub use mode::{
     SavedProfileSummary, SyncPlanCell, TextInputPrompt, TextInputPurpose,
 };
 pub use panel::PanelState;
-pub use transport::{negotiate_transport, Transport, VfsStreamTransport};
-pub use vfs::{EntryKind, EntryMeta, Location, ProfileId, Vfs, VfsCapabilities, VfsError, VfsPath, VfsResult};
+pub use transport::{negotiate_transport, RemoteFileAgent, Transport, VfsStreamTransport};
+pub use vfs::{
+    ConnectionInfo, EntryKind, EntryMeta, Location, ProfileId, QuicConnectionInfo, Vfs, VfsCapabilities, VfsError,
+    VfsPath, VfsResult,
+};

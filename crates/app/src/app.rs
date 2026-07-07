@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use pfnc_config::{Config, PanelLocationConfig, PanelSessionConfig};
-use pfnc_core::{JobManager, Location, Mode, PanelState, VfsPath};
+use pfnc_core::{JobId, JobManager, Location, Mode, PanelState, ProfileId, VfsPath};
 
 use crate::editor::EditTarget;
 use crate::keymap::Keymap;
@@ -13,6 +14,22 @@ pub enum PaneSide {
     Right,
 }
 
+/// A job that runs on a background thread (via `App::jobs`, same as any
+/// other) but — unlike every `JobKind` — never takes over `app.mode` with a
+/// modal `Mode::Progress` dialog. `actions::handle_job_event` checks
+/// `App::background_jobs` before falling back to the `Mode::Progress`-based
+/// dispatch, so a background job's completion is handled without disturbing
+/// whatever the UI is currently showing.
+#[derive(Clone, Debug)]
+pub enum BackgroundJob {
+    /// Deploys/connects a QUIC fast-path agent for an already-established
+    /// SFTP connection, silently, after the panel is already browsable —
+    /// see `actions::submit_connect`. On completion, whichever panel(s)
+    /// currently point at `profile_id` (directly or via an archive layered
+    /// over it) get their `quic_available` glyph updated to match.
+    WarmQuicFastPath { profile_id: ProfileId },
+}
+
 pub struct App {
     pub registry: Arc<VfsRegistry>,
     pub left: PanelState,
@@ -20,6 +37,9 @@ pub struct App {
     pub active: PaneSide,
     pub mode: Mode,
     pub jobs: JobManager,
+    /// Job IDs spawned via `jobs` that should *not* be treated as the
+    /// current `Mode::Progress` job when they finish — see `BackgroundJob`.
+    pub background_jobs: HashMap<JobId, BackgroundJob>,
     pub status: Option<String>,
     pub should_quit: bool,
     /// Set by F3 ("Edit"); the main loop takes this and runs
@@ -70,6 +90,7 @@ impl App {
             active: PaneSide::Left,
             mode: Mode::Browsing,
             jobs: JobManager::new(),
+            background_jobs: HashMap::new(),
             status: None,
             should_quit: false,
             edit_request: None,
@@ -138,6 +159,64 @@ fn restorable_local_cwd(saved: Option<&PanelSessionConfig>) -> Option<VfsPath> {
     }
 }
 
+/// Whether `location`'s connection (or, for an archive, whatever it's
+/// layered over) has a QUIC fast-path agent available — used to set
+/// `PanelState::quic_available` right after a connect/archive-open job
+/// completes, and again once a `BackgroundJob::WarmQuicFastPath` job
+/// finishes (see `update_quic_available_for_profile`). Calling this before
+/// that warm-up has run (or completed) is safe — it just triggers
+/// `Vfs::fast_transport()`'s own probe-and-cache — but `submit_connect`
+/// deliberately defers the actual probe to a background job so it never
+/// blocks the UI thread; this function itself doesn't guarantee that.
+pub fn quic_available_for(registry: &VfsRegistry, location: &Location) -> bool {
+    match location {
+        Location::Local => false,
+        Location::Remote { .. } => {
+            registry.resolve(location).ok().and_then(|vfs| vfs.fast_transport()).is_some()
+        }
+        Location::Archive { base, .. } => quic_available_for(registry, base),
+    }
+}
+
+/// Whether `location` is (or, for an archive, is layered over) exactly
+/// `profile_id` — used to find which panel(s) a finished
+/// `BackgroundJob::WarmQuicFastPath` job is relevant to.
+fn location_uses_profile(location: &Location, profile_id: &ProfileId) -> bool {
+    match location {
+        Location::Local => false,
+        Location::Remote { profile_id: id } => id == profile_id,
+        Location::Archive { base, .. } => location_uses_profile(base, profile_id),
+    }
+}
+
+/// Re-derives `quic_available` (via the already-cached
+/// `Vfs::fast_transport()`, see `quic_available_for`) for whichever of
+/// `app.left`/`app.right` currently point at `profile_id` — called once a
+/// `BackgroundJob::WarmQuicFastPath` job finishes, so the panel glyph
+/// flips from plain-remote to QUIC-fast-path asynchronously, without ever
+/// having blocked the Connect flow on the probe itself.
+pub fn update_quic_available_for_profile(app: &mut App, profile_id: &ProfileId) {
+    if location_uses_profile(&app.left.location, profile_id) {
+        app.left.quic_available = quic_available_for(&app.registry, &app.left.location);
+    }
+    if location_uses_profile(&app.right.location, profile_id) {
+        app.right.quic_available = quic_available_for(&app.registry, &app.right.location);
+    }
+}
+
+/// Diagnostic info about `location`'s connection (or, for an archive,
+/// whatever it's layered over), for the F1 Help box — `None` for
+/// `Location::Local`. Only reads already-cached facts (see
+/// `Vfs::connection_info`), so this is safe to call directly from render
+/// code on every keypress that opens the Help dialog.
+pub fn connection_info_for(registry: &VfsRegistry, location: &Location) -> Option<pfnc_core::ConnectionInfo> {
+    match location {
+        Location::Local => None,
+        Location::Remote { .. } => registry.resolve(location).ok().and_then(|vfs| vfs.connection_info()),
+        Location::Archive { base, .. } => connection_info_for(registry, base),
+    }
+}
+
 /// Reload a panel's directory listing from its backend, clearing selection
 /// and keeping the cursor in range if the listing shrank. Resolving the
 /// backend or listing the directory can fail (e.g. a dropped SFTP
@@ -165,5 +244,32 @@ pub fn selected_items(panel: &PanelState) -> Vec<VfsPath> {
         vec![entry.path.clone()]
     } else {
         vec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn location_uses_profile_is_false_for_local() {
+        assert!(!location_uses_profile(&Location::Local, &"p1".to_string()));
+    }
+
+    #[test]
+    fn location_uses_profile_matches_direct_remote() {
+        let location = Location::Remote { profile_id: "p1".to_string() };
+        assert!(location_uses_profile(&location, &"p1".to_string()));
+        assert!(!location_uses_profile(&location, &"p2".to_string()));
+    }
+
+    #[test]
+    fn location_uses_profile_recurses_through_archive() {
+        let location = Location::Archive {
+            base: Box::new(Location::Remote { profile_id: "p1".to_string() }),
+            archive_path: VfsPath::from("/some.tar"),
+        };
+        assert!(location_uses_profile(&location, &"p1".to_string()));
+        assert!(!location_uses_profile(&location, &"p2".to_string()));
     }
 }

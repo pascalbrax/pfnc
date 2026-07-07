@@ -112,15 +112,76 @@ mod tests {
     }
 
     #[test]
+    fn remote_panel_with_quic_available_shows_a_distinct_glyph() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut left = sample_panel();
+        left.location = Location::Remote { profile_id: "user@host:22".to_string() };
+        left.quic_available = true;
+        let mut right = sample_panel();
+        right.location = Location::Remote { profile_id: "user@otherhost:22".to_string() };
+
+        terminal
+            .draw(|f| {
+                let (panels_area, _status, _fkeys) = split_main(f.area());
+                let (left_rect, right_rect) = split_panels(panels_area);
+                render_panel(f, left_rect, &mut left, true);
+                render_panel(f, right_rect, &mut right, false);
+            })
+            .unwrap();
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains('⚡'), "a remote panel with QUIC available should show the fast-path glyph");
+        assert!(rendered.contains('⇄'), "a remote panel without QUIC available should still show the plain remote glyph");
+    }
+
+    #[test]
     fn renders_help_with_github_url() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| render_help(f, f.area())).unwrap();
+        terminal.draw(|f| render_help(f, f.area(), None)).unwrap();
 
         let rendered = rendered_text(&terminal);
         assert!(rendered.contains("pfnc"));
         assert!(rendered.contains("github.com/pascalbrax"));
+    }
+
+    #[test]
+    fn renders_help_with_quic_connection_details() {
+        use pfnc_core::{ConnectionInfo, QuicConnectionInfo};
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let info = ConnectionInfo {
+            protocol: "SFTP",
+            remote_os: Some("Linux".to_string()),
+            quic: Some(QuicConnectionInfo { local_port: Some(51820), remote_port: 4433, agent_pid: 12345 }),
+        };
+
+        terminal.draw(|f| render_help(f, f.area(), Some(&info))).unwrap();
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("SFTP"), "should show the connection protocol");
+        assert!(rendered.contains("Linux"), "should show the remote OS");
+        assert!(rendered.contains("51820"), "should show the local QUIC port");
+        assert!(rendered.contains("4433"), "should show the remote QUIC port");
+        assert!(rendered.contains("12345"), "should show the listening pfnc-agent's pid");
+    }
+
+    #[test]
+    fn renders_help_without_quic_when_not_available() {
+        use pfnc_core::ConnectionInfo;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let info = ConnectionInfo { protocol: "SFTP", remote_os: Some("Darwin".to_string()), quic: None };
+
+        terminal.draw(|f| render_help(f, f.area(), Some(&info))).unwrap();
+
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Darwin"));
+        assert!(rendered.contains("not available"), "should say QUIC isn't available rather than showing stale ports");
     }
 
     fn panel_with_many_entries(count: usize, cursor: usize) -> PanelState {

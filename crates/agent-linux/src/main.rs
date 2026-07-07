@@ -13,7 +13,19 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(port: u16) -> anyhow::Result<()> {
-    let addr: SocketAddr = format!("0.0.0.0:{port}").parse()?;
+    // Prefer `[::]` (dual-stack on Linux, so IPv4-mapped clients still get
+    // through) over `0.0.0.0`, since a client resolving this host to a real
+    // IPv6 address (increasingly common on LANs via SLAAC/ULA) can't reach
+    // an IPv4-only bind — but some hosts have IPv6 disabled at the kernel
+    // level entirely (common on minimal/hardened VPS images), where even
+    // *attempting* an IPv6 bind fails outright (`EAFNOSUPPORT`). Neither
+    // family can be assumed, so this probes with a cheap, throwaway socket
+    // first rather than gambling on one and letting deployment fail.
+    let addr: SocketAddr = if ipv6_supported() {
+        format!("[::]:{port}").parse()?
+    } else {
+        format!("0.0.0.0:{port}").parse()?
+    };
 
     let (cert, key) = pfnc_agent_linux::generate_self_signed_cert()?;
     let cert_for_startup_line = cert.clone();
@@ -35,6 +47,15 @@ async fn run(port: u16) -> anyhow::Result<()> {
 
 fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Whether this host can bind an IPv6 socket at all — some hosts (minimal
+/// containers, hardened VPS images) disable IPv6 at the kernel level, where
+/// even a wildcard `[::]` bind fails immediately rather than just being
+/// unreachable. A throwaway `UdpSocket::bind` is a cheap, synchronous way to
+/// find out before committing to a real (cert-bearing) QUIC bind.
+fn ipv6_supported() -> bool {
+    std::net::UdpSocket::bind("[::]:0").is_ok()
 }
 
 /// Parses the one CLI arg this agent understands: `--port <N>` (default

@@ -39,6 +39,14 @@ pub struct GeneralConfig {
     /// delete, and the scan-then-confirm flow always shows the user
     /// exactly what a `true` setting would remove before it happens.
     pub sync_delete_extraneous: bool,
+    /// Whether a Local<->Remote(SFTP) copy/sync may try the faster
+    /// QUIC-agent transport (auto-deployed to the remote host over SSH,
+    /// only attempted when the remote host is detected as Linux). Defaults
+    /// to `true`; any failure at any stage silently falls back to plain
+    /// SFTP, so this is safe to leave on, but it does mean pfnc will upload
+    /// and execute a small binary on remote hosts it connects to unless
+    /// explicitly turned off here.
+    pub enable_quic_fast_path: bool,
 }
 
 impl Default for GeneralConfig {
@@ -47,6 +55,7 @@ impl Default for GeneralConfig {
             confirm_delete: true,
             show_hidden: false,
             sync_delete_extraneous: false,
+            enable_quic_fast_path: true,
         }
     }
 }

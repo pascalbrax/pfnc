@@ -59,19 +59,202 @@ impl QuicAgentHandle {
     }
 }
 
+/// How many `pfnc_agent_linux::CHUNK_SIZE` chunks may sit buffered between
+/// the scoped local-I/O thread and the QUIC connection at once — see the
+/// module-level pipelining docs above `read_file`/`write_file` below. Purely
+/// an internal implementation constant (bounds a small, fixed amount of
+/// read-ahead memory — `PIPELINE_DEPTH * CHUNK_SIZE`, 1 MiB at the current
+/// chunk size); not worth exposing as user-facing config.
+const PIPELINE_DEPTH: usize = 4;
+
+/// Log `quinn`'s connection stats every this-many chunks during a transfer
+/// (in addition to once at the end), not just at the end — a single
+/// end-of-transfer snapshot can't distinguish "the congestion window grew
+/// throughout and this is just its final value" from "it never grew at
+/// all," which matters a great deal for diagnosing a throughput cap. At the
+/// current `CHUNK_SIZE` (256 KiB) this logs roughly every 10 MiB.
+const STATS_LOG_INTERVAL_CHUNKS: u64 = 40;
+
 impl RemoteFileAgent for QuicAgentHandle {
+    /// Downloads `path` from the agent, writing it to `writer`. `writer` is
+    /// `&mut dyn Write` with no `Send` bound (matching `pfnc-core`'s
+    /// `Vfs`/`RemoteFileAgent` traits), so it can never cross a thread
+    /// boundary — instead, the QUIC receive loop itself runs on a second,
+    /// scoped OS thread (everything it touches — `self`, `path` — is already
+    /// `Send`/`Sync`, required by `RemoteFileAgent`'s own supertrait bound),
+    /// forwarding chunks back to *this* thread over a small bounded channel
+    /// for the actual (possibly slow/blocking) local disk write. See
+    /// `write_file` below for why this pipelining exists.
     fn read_file(&self, path: &VfsPath, writer: &mut dyn Write) -> Result<u64, JobError> {
-        self.runtime
-            .block_on(pfnc_agent_linux::read_file(&self.connection, path.as_str(), |chunk| writer.write_all(chunk)))
-            .map_err(|e| JobError::Vfs(VfsError::Io(std::io::Error::other(e.to_string()))))
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(PIPELINE_DEPTH);
+
+            let net_thread = scope.spawn(move || {
+                let mut chunks_seen = 0u64;
+                let mut bytes_seen = 0u64;
+                let on_chunk = |chunk: &[u8]| -> std::io::Result<()> {
+                    chunks_seen += 1;
+                    bytes_seen += chunk.len() as u64;
+                    if chunks_seen % STATS_LOG_INTERVAL_CHUNKS == 0 {
+                        log_connection_stats(&self.connection, Some(bytes_seen));
+                    }
+                    tx.send(Ok(chunk.to_vec()))
+                        .map_err(|_| std::io::Error::other("local writer stopped accepting data"))
+                };
+                let result = self.runtime.block_on(pfnc_agent_linux::read_file(&self.connection, path.as_str(), on_chunk));
+                log_connection_stats(&self.connection, None);
+                result
+            });
+
+            let mut total = 0u64;
+            let mut write_err = None;
+            loop {
+                match rx.recv() {
+                    Ok(Ok(chunk)) => match writer.write_all(&chunk) {
+                        Ok(()) => total += chunk.len() as u64,
+                        Err(e) => {
+                            write_err = Some(e);
+                            break;
+                        }
+                    },
+                    // The network side only ever sends `Ok(_)` on this leg
+                    // (its own errors surface via `net_thread`'s own return
+                    // value instead) — kept for symmetry/robustness only.
+                    Ok(Err(e)) => {
+                        write_err = Some(e);
+                        break;
+                    }
+                    Err(_) => break, // channel closed: network side is done.
+                }
+            }
+            // Explicit, not left to fall out at the end of this block: if we
+            // broke out of the loop early on a local write error, the
+            // network thread's `on_chunk` may still be parked on a full
+            // channel with nothing left to drain it — dropping `rx` here,
+            // *before* `join()`, is what unblocks it (its `tx.send` starts
+            // returning `Err` immediately once the receiver is gone) so the
+            // join below can't deadlock.
+            drop(rx);
+
+            let net_result = net_thread.join().expect("QUIC download's network thread panicked");
+            match (net_result, write_err) {
+                (Ok(total_read), None) => {
+                    debug_assert_eq!(total_read, total, "bytes read over QUIC must match bytes written locally");
+                    Ok(total)
+                }
+                (Err(e), _) => Err(JobError::Vfs(VfsError::Io(std::io::Error::other(e.to_string())))),
+                (Ok(_), Some(e)) => Err(JobError::Vfs(VfsError::Io(e))),
+            }
+        })
     }
 
+    /// Uploads `path` to the agent, reading it from `reader`. Same shape as
+    /// `read_file` above, mirrored: `reader` (`&mut dyn Read`, no `Send`
+    /// bound) stays on this thread, and the QUIC send loop runs on a second,
+    /// scoped thread, fed local chunks over a small bounded channel.
+    ///
+    /// This pipelining exists because a real LAN measurement found the QUIC
+    /// fast path *slower* than plain SFTP despite identical chunk sizes and
+    /// a release build (see `roadmap.md`'s "Known limitations"): `quinn`'s
+    /// own stats showed zero UDP GSO/GRO batching (`udp_tx_ios` ==
+    /// `udp_tx_datagrams`) even though the kernel supports both — the
+    /// strict, unpipelined read-then-await-send loop this replaced
+    /// synchronously blocked the QUIC-driving thread on every single local
+    /// disk read, starving `quinn`'s internal endpoint-driving task of the
+    /// prompt, repeated polling it needs to batch outgoing datagrams. With a
+    /// dedicated thread reading a few chunks ahead into a bounded queue, the
+    /// QUIC side almost never actually waits on local I/O once the pipeline
+    /// is primed. `std::thread::scope` (not `tokio::task::spawn_blocking`)
+    /// is what makes this possible without changing `pfnc-core` at all:
+    /// `reader` is borrowed with this call's own stack lifetime, not
+    /// `'static`, which `spawn_blocking` requires but a scoped thread does
+    /// not.
     fn write_file(&self, path: &VfsPath, mode: Option<u32>, reader: &mut dyn Read) -> Result<(), JobError> {
-        self.runtime
-            .block_on(pfnc_agent_linux::write_file(&self.connection, path.as_str(), mode, |buf| reader.read(buf)))
-            .map(|_| ())
-            .map_err(|e| JobError::Vfs(VfsError::Io(std::io::Error::other(e.to_string()))))
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(PIPELINE_DEPTH);
+
+            let net_thread = scope.spawn(move || {
+                let mut chunks_seen = 0u64;
+                let mut bytes_seen = 0u64;
+                let next_chunk = |buf: &mut [u8]| -> std::io::Result<usize> {
+                    match rx.recv() {
+                        Ok(Ok(chunk)) => {
+                            chunks_seen += 1;
+                            bytes_seen += chunk.len() as u64;
+                            if chunks_seen % STATS_LOG_INTERVAL_CHUNKS == 0 {
+                                log_connection_stats(&self.connection, Some(bytes_seen));
+                            }
+                            buf[..chunk.len()].copy_from_slice(&chunk);
+                            Ok(chunk.len())
+                        }
+                        Ok(Err(e)) => Err(e),
+                        Err(_) => Ok(0), // channel closed: local reader is done.
+                    }
+                };
+                let result =
+                    self.runtime.block_on(pfnc_agent_linux::write_file(&self.connection, path.as_str(), mode, next_chunk));
+                log_connection_stats(&self.connection, None);
+                result
+            });
+
+            loop {
+                let mut buf = vec![0u8; pfnc_agent_linux::CHUNK_SIZE];
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.truncate(n);
+                        if tx.send(Ok(buf)).is_err() {
+                            break; // network thread gave up (e.g. a send error); stop reading.
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        break;
+                    }
+                }
+            }
+            // Explicit, same reasoning as `read_file` above: if the network
+            // thread's `next_chunk` is parked waiting on a full channel
+            // because we broke out of this loop early, dropping `tx` here —
+            // before `join()` — unblocks it rather than risking a deadlock.
+            drop(tx);
+
+            net_thread
+                .join()
+                .expect("QUIC upload's network thread panicked")
+                .map(|_| ())
+                .map_err(|e| JobError::Vfs(VfsError::Io(std::io::Error::other(e.to_string()))))
+        })
     }
+}
+
+/// Logs `quinn`'s own transport-level stats for this connection right after
+/// a transfer — real congestion-control/packet-loss/MTU numbers straight
+/// from the QUIC state machine, rather than guessing about them. In
+/// particular, `udp_tx.ios < udp_tx.datagrams` would confirm GSO batching is
+/// actually happening (fewer syscalls than datagrams sent); `path.cwnd`
+/// staying small or `path.lost_packets`/`congestion_events` climbing would
+/// point at congestion control rather than raw crypto/syscall throughput.
+/// `debug`-level: this is transport-internals diagnostic data (see
+/// `roadmap.md`'s "Known limitations" for what it was used to root-cause),
+/// not something a normal run needs to surface by default — set
+/// `RUST_LOG=debug` to see it.
+fn log_connection_stats(connection: &quinn::Connection, bytes_so_far: Option<u64>) {
+    let stats = connection.stats();
+    tracing::debug!(
+        bytes_so_far,
+        rtt_ms = stats.path.rtt.as_millis() as u64,
+        cwnd = stats.path.cwnd,
+        congestion_events = stats.path.congestion_events,
+        lost_packets = stats.path.lost_packets,
+        sent_packets = stats.path.sent_packets,
+        current_mtu = stats.path.current_mtu,
+        udp_tx_datagrams = stats.udp_tx.datagrams,
+        udp_tx_ios = stats.udp_tx.ios,
+        udp_rx_datagrams = stats.udp_rx.datagrams,
+        udp_rx_ios = stats.udp_rx.ios,
+        "quic connection stats"
+    );
 }
 
 /// Whether a `uname -s` output indicates a host `pfnc-agent-linux` can run

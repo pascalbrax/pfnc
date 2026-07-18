@@ -36,8 +36,11 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// Bound on how much file content is held in memory at once by
 /// `read_file`/`write_file` (both client and agent side) — chosen to match
 /// `pfnc_core::transport`'s own `COPY_CHUNK_SIZE`, though this crate has no
-/// dependency on `pfnc-core` to share the constant with.
-const CHUNK_SIZE: usize = 256 * 1024;
+/// dependency on `pfnc-core` to share the constant with. `pub` so
+/// `pfnc-vfs-sftp`'s pipelined `QuicAgentHandle` can size its own read-ahead
+/// buffers to match exactly, rather than risking drift from a duplicated
+/// magic number.
+pub const CHUNK_SIZE: usize = 256 * 1024;
 
 /// Generates a fresh, ephemeral self-signed certificate for one agent
 /// process's lifetime.

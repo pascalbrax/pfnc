@@ -76,6 +76,111 @@ fn copy_job_local_to_remote_actually_uses_the_deployed_quic_agent() {
 }
 
 #[test]
+#[ignore = "spawns a real local sshd and a real subprocess; run with `cargo test -p pfnc-vfs-sftp -- --ignored`"]
+fn copy_job_copies_a_nested_directory_tree_over_the_quic_fast_path() {
+    let sshd = TestSshd::start();
+    let vfs = SftpFs::connect(&sshd.profile("quictree"), &AcceptNewPolicy, &sshd.known_hosts_path).unwrap();
+    let remote_dir = sshd.scratch_dir();
+
+    let agent = vfs.fast_transport();
+    assert!(agent.is_some(), "expected a real QUIC agent to deploy and connect against a local Linux sshd");
+    drop(agent);
+
+    let local_dir = tempfile::tempdir().unwrap();
+    let local_vfs = LocalFs::new();
+    let local_root = Utf8PathBuf::from_path_buf(local_dir.path().to_path_buf()).unwrap();
+
+    // src/
+    //   top.txt
+    //   sub1/
+    //     a.txt
+    //     sub2/
+    //       b.txt
+    //       sub3/
+    //         c.txt
+    let src_dir = local_root.join("src");
+    std::fs::create_dir_all(src_dir.join("sub1/sub2/sub3").as_std_path()).unwrap();
+    std::fs::write(src_dir.join("top.txt").as_std_path(), b"top").unwrap();
+    std::fs::write(src_dir.join("sub1/a.txt").as_std_path(), b"a").unwrap();
+    std::fs::write(src_dir.join("sub1/sub2/b.txt").as_std_path(), b"b").unwrap();
+    std::fs::write(src_dir.join("sub1/sub2/sub3/c.txt").as_std_path(), b"c").unwrap();
+
+    let dest_dir = Utf8PathBuf::from_path_buf(remote_dir.clone()).unwrap();
+    let cancel = CancellationToken::new();
+    copy_job(
+        &local_vfs,
+        &vfs,
+        &Location::Local,
+        &Location::Remote { profile_id: "quictree".to_string() },
+        &[src_dir],
+        &dest_dir,
+        true,
+        &cancel,
+        &noop_report,
+    )
+    .unwrap();
+
+    let landed = remote_dir.join("src");
+    assert_eq!(std::fs::read(landed.join("top.txt")).unwrap(), b"top");
+    assert_eq!(std::fs::read(landed.join("sub1/a.txt")).unwrap(), b"a");
+    assert_eq!(std::fs::read(landed.join("sub1/sub2/b.txt")).unwrap(), b"b");
+    assert_eq!(std::fs::read(landed.join("sub1/sub2/sub3/c.txt")).unwrap(), b"c");
+}
+
+#[test]
+#[ignore = "spawns a real local sshd and a real subprocess; run with `cargo test -p pfnc-vfs-sftp -- --ignored`"]
+fn copy_job_copies_a_large_directory_tree_over_the_quic_fast_path() {
+    let sshd = TestSshd::start();
+    let vfs = SftpFs::connect(&sshd.profile("quicbig"), &AcceptNewPolicy, &sshd.known_hosts_path).unwrap();
+    let remote_dir = sshd.scratch_dir();
+
+    let agent = vfs.fast_transport();
+    assert!(agent.is_some(), "expected a real QUIC agent to deploy and connect against a local Linux sshd");
+    drop(agent);
+
+    let local_dir = tempfile::tempdir().unwrap();
+    let local_vfs = LocalFs::new();
+    let local_root = Utf8PathBuf::from_path_buf(local_dir.path().to_path_buf()).unwrap();
+
+    let src_dir = local_root.join("bigsrc");
+    let mut expected: Vec<Utf8PathBuf> = Vec::new();
+    for dir_idx in 0..10 {
+        let sub = src_dir.join(format!("dir{dir_idx}"));
+        std::fs::create_dir_all(sub.as_std_path()).unwrap();
+        for file_idx in 0..10 {
+            let file = sub.join(format!("file{file_idx}.txt"));
+            std::fs::write(file.as_std_path(), format!("dir{dir_idx}-file{file_idx}")).unwrap();
+            expected.push(file);
+        }
+    }
+
+    let dest_dir = Utf8PathBuf::from_path_buf(remote_dir.clone()).unwrap();
+    let cancel = CancellationToken::new();
+    copy_job(
+        &local_vfs,
+        &vfs,
+        &Location::Local,
+        &Location::Remote { profile_id: "quicbig".to_string() },
+        std::slice::from_ref(&src_dir),
+        &dest_dir,
+        true,
+        &cancel,
+        &noop_report,
+    )
+    .unwrap();
+
+    let mut missing = Vec::new();
+    for file in &expected {
+        let rel = file.strip_prefix(&local_root).unwrap();
+        let landed = remote_dir.join(rel.as_str());
+        if !landed.exists() {
+            missing.push(landed);
+        }
+    }
+    assert!(missing.is_empty(), "missing {} of {} files after QUIC copy: {:?}", missing.len(), expected.len(), missing);
+}
+
+#[test]
 #[ignore = "spawns a real local sshd; run with `cargo test -p pfnc-vfs-sftp -- --ignored`"]
 fn connection_info_reports_remote_os_even_without_probing_quic() {
     let sshd = TestSshd::start();

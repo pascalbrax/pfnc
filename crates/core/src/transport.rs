@@ -15,6 +15,7 @@
 
 use std::io::{Read, Write};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::job::{CancellationToken, JobError, JobProgress};
 use crate::vfs::{Location, Vfs, VfsError, VfsPath};
@@ -56,6 +57,19 @@ pub trait Transport: Send + Sync {
 
 const COPY_CHUNK_SIZE: usize = 256 * 1024;
 
+/// Logs throughput for a single file's transfer — cheap diagnostic data for
+/// comparing real-world transfer speed (plain SFTP vs. the QUIC fast path,
+/// or against another tool entirely) without needing a separate profiling
+/// setup. `bytes` is just this one file's size, not the whole job's total.
+/// `debug`-level (not `info`): a bulk copy/sync of thousands of small files
+/// would otherwise flood the default log with one line per file — set
+/// `RUST_LOG=debug` (or `pfnc-core=debug`) to see these.
+fn log_transfer_throughput(transport: &str, path: &VfsPath, bytes: u64, elapsed: std::time::Duration) {
+    let secs = elapsed.as_secs_f64();
+    let mib_per_sec = if secs > 0.0 { (bytes as f64 / 1024.0 / 1024.0) / secs } else { f64::INFINITY };
+    tracing::debug!(transport, %path, bytes, elapsed_ms = elapsed.as_millis() as u64, mib_per_sec, "file transfer finished");
+}
+
 /// The only `Transport` today: a plain chunked copy through each backend's
 /// `Vfs::open_read`/`create_write` streams. Correct for any backend
 /// combination (local-local, local-remote, remote-remote, archive-*)
@@ -74,10 +88,12 @@ impl Transport for VfsStreamTransport {
         progress: &mut JobProgress,
         report: &dyn Fn(JobProgress),
     ) -> Result<(), JobError> {
+        let started = Instant::now();
         let mut reader = src.open_read(src_path)?;
         let mut writer = dst.create_write(dst_path, mode)?;
 
         let mut buf = vec![0u8; COPY_CHUNK_SIZE];
+        let mut file_bytes = 0u64;
         loop {
             if cancel.is_cancelled() {
                 return Err(JobError::Cancelled);
@@ -87,10 +103,12 @@ impl Transport for VfsStreamTransport {
                 break;
             }
             writer.write_all(&buf[..n]).map_err(VfsError::from)?;
+            file_bytes += n as u64;
             progress.bytes_done += n as u64;
             report(progress.clone());
         }
         writer.flush().map_err(VfsError::from)?;
+        log_transfer_throughput("vfs-stream", src_path, file_bytes, started.elapsed());
         Ok(())
     }
 }
@@ -173,6 +191,8 @@ impl Transport for QuicSideTransport {
             return Err(JobError::Cancelled);
         }
 
+        let started = Instant::now();
+        let bytes_before = progress.bytes_done;
         let result = if self.remote_is_src {
             let mut writer = dst.create_write(dst_path, mode)?;
             let mut wrapped = ProgressIo { inner: &mut writer, cancel, progress, report };
@@ -185,6 +205,7 @@ impl Transport for QuicSideTransport {
 
         match result {
             Ok(()) => {
+                log_transfer_throughput("quic-agent", src_path, progress.bytes_done - bytes_before, started.elapsed());
                 progress.files_done += 1;
                 report(progress.clone());
                 Ok(())
